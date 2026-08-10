@@ -1,0 +1,39 @@
+[build-system]
+requires = ["uv_build>=0.8.15,<0.9.0"]
+build-backend = "uv_build"
+
+[project]
+name = "rosa-torch"
+version = "0.1.0"
+description = "Differentiable sparse retrieval backed by an exact suffix automaton"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Lucas", email = "30107107+aabbdev@users.noreply.github.com" },
+]
+dependencies = ["torch"]
+
+[project.urls]
+Repository = "https://github.com/aabbdev/rosa"
+
+[dependency-groups]
+dev = [
+    "coverage>=7.10",
+    "pyright[nodejs]>=1.1.400",
+    "ruff>=0.11",
+]
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP"]
+
+[tool.pyright]
+include = ["src/rosa"]
+pythonVersion = "3.10"
+
+[tool.uv.build-backend]
+module-name = "rosa"
