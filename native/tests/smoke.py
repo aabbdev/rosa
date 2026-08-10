@@ -5,6 +5,7 @@ import rosa_native_step
 import torch
 
 from rosa._stateful_numba import _forward_step, _init_inference_state, _prefill
+from rosa.ragged import RaggedInferenceState
 
 
 def assert_same_initialized_state(oracle: object, candidate: object) -> None:
@@ -134,6 +135,83 @@ def main() -> None:
         assert "layout" in str(error)
     else:
         raise AssertionError("malformed native state was accepted")
+
+    native_ragged = RaggedInferenceState(5, 40, use_native=True)
+    fallback_ragged = RaggedInferenceState(5, 40, use_native=False)
+    for tick in range(40):
+        step_tokens = torch.tensor(
+            [(tick * 3 + row * 5) % 11 - 2 for row in range(5)], dtype=torch.long
+        )
+        active = torch.tensor(
+            [(tick + row) % (row + 2) != 0 for row in range(5)], dtype=torch.uint8
+        )
+        reset = torch.tensor(
+            [tick in (8 + row, 20 + row, 32 + row) for row in range(5)],
+            dtype=torch.uint8,
+        )
+        expected = fallback_ragged.step_masked(step_tokens, active, reset)
+        actual = native_ragged.step_masked(step_tokens, active, reset)
+        assert torch.equal(actual, expected), (tick, actual, expected)
+        assert torch.equal(native_ragged.positions, fallback_ragged.positions)
+    assert native_ragged.using_native
+
+    direct_state = _init_inference_state(2, 4)
+    direct_state.positions = np.zeros(2, dtype=np.int64)
+    direct = rosa_native_step.NativeState(direct_state)
+    direct_output = direct.step_masked(
+        np.array([7, 9], dtype=np.int64),
+        np.array([True, False], dtype=np.bool_),
+        np.array([False, True], dtype=np.bool_),
+    )
+    assert direct_output.tolist() == [-1, -1]
+    assert direct.positions.tolist() == [1, 0]
+    try:
+        direct.step(np.array([1, 2], dtype=np.int64))
+    except RuntimeError as error:
+        assert "uniform" in str(error)
+    else:
+        raise AssertionError("ragged native state accepted a uniform step")
+    try:
+        direct.prefill(np.zeros((2, 1), dtype=np.int64))
+    except RuntimeError as error:
+        assert "ragged" in str(error)
+    else:
+        raise AssertionError("ragged native state accepted prefill")
+
+    uniform = rosa_native_step.NativeState(_init_inference_state(2, 4))
+    try:
+        uniform.step_masked(
+            np.array([1, 2], dtype=np.int64),
+            np.ones(2, dtype=np.uint8),
+            np.zeros(2, dtype=np.uint8),
+        )
+    except RuntimeError as error:
+        assert "ragged" in str(error)
+    else:
+        raise AssertionError("uniform native state accepted a masked step")
+    for invalid_tokens, invalid_active, invalid_reset in (
+        (
+            np.zeros(2, dtype=np.int32),
+            np.ones(2, dtype=np.uint8),
+            np.zeros(2, dtype=np.uint8),
+        ),
+        (
+            np.zeros(2, dtype=np.int64),
+            np.ones(2, dtype=np.int64),
+            np.zeros(2, dtype=np.uint8),
+        ),
+        (
+            np.zeros(2, dtype=np.int64),
+            np.ones(3, dtype=np.uint8),
+            np.zeros(2, dtype=np.uint8),
+        ),
+    ):
+        try:
+            direct.step_masked(invalid_tokens, invalid_active, invalid_reset)
+        except (TypeError, ValueError):
+            pass
+        else:
+            raise AssertionError("invalid masked-step input was accepted")
     print("rosa_native_step smoke: ok")
 
 

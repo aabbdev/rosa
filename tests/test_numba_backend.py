@@ -66,6 +66,10 @@ class TestNumbaBackend(unittest.TestCase):
         state = _init_inference_state(1, 1)
         state.native_state = False
         self.assertEqual(_forward_step(state, torch.tensor(0)).shape, (1,))
+
+        prefill_state = _init_inference_state(1, 2)
+        prefill_state.native_state = False
+        self.assertEqual(_prefill(prefill_state, torch.tensor([[0, 1]])).shape, (1, 2))
         with self.assertRaisesRegex(ValueError, "shape"):
             _forward_step(state, torch.tensor([1, 2]))
 

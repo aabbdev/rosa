@@ -556,6 +556,106 @@ def _step_batch_kernel(  # pragma: no cover - executed as compiled Numba code
 
 
 @njit(cache=True, nogil=True)
+def _step_masked_kernel(  # pragma: no cover - executed as compiled Numba code
+    tokens: np.ndarray,
+    active: np.ndarray,
+    reset: np.ndarray,
+    positions: np.ndarray,
+    history: np.ndarray,
+    head: np.ndarray,
+    edge_token: np.ndarray,
+    edge_target: np.ndarray,
+    edge_next: np.ndarray,
+    hash_state: np.ndarray,
+    hash_token: np.ndarray,
+    hash_edge: np.ndarray,
+    suffix_link: np.ndarray,
+    length: np.ndarray,
+    lct_left: np.ndarray,
+    lct_right: np.ndarray,
+    lct_parent: np.ndarray,
+    lct_value: np.ndarray,
+    lct_lazy: np.ndarray,
+    lct_lazy_valid: np.ndarray,
+    lct_stack: np.ndarray,
+    last: np.ndarray,
+    size: np.ndarray,
+    edge_count: np.ndarray,
+) -> np.ndarray:
+    output = np.full(tokens.shape[0], -1, dtype=np.int64)
+    for row in range(tokens.shape[0]):
+        if active[row] == 0:
+            continue
+        if reset[row] != 0:
+            used_states = int(size[row])
+            used_edges = int(edge_count[row])
+            mask = hash_state.shape[1] - 1
+            occupied_slots = np.empty(used_edges, dtype=np.int64)
+            occupied_count = 0
+            for state in range(used_states):
+                edge = int(head[row, state])
+                while edge != -1:
+                    token = int(edge_token[row, edge])
+                    slot = np.int64(_transition_hash(state, token) & np.uint64(mask))
+                    while hash_state[row, slot] != -1:
+                        if (
+                            hash_state[row, slot] == state
+                            and hash_token[row, slot] == token
+                        ):
+                            occupied_slots[occupied_count] = slot
+                            occupied_count += 1
+                            break
+                        slot = (slot + 1) & mask
+                    edge = int(edge_next[row, edge])
+            for index in range(occupied_count):
+                hash_state[row, occupied_slots[index]] = -1
+            for state in range(used_states):
+                head[row, state] = -1
+                suffix_link[row, state] = -1
+                length[row, state] = 0
+                lct_left[row, state] = -1
+                lct_right[row, state] = -1
+                lct_parent[row, state] = -1
+                lct_value[row, state] = -1
+                lct_lazy_valid[row, state] = 0
+            last[row] = 0
+            size[row] = 1
+            edge_count[row] = 0
+            positions[row] = 0
+        position = int(positions[row])
+        prediction, new_last, new_size, new_edge_count = _step_row(
+            int(tokens[row]),
+            position,
+            history[row],
+            head[row],
+            edge_token[row],
+            edge_target[row],
+            edge_next[row],
+            hash_state[row],
+            hash_token[row],
+            hash_edge[row],
+            suffix_link[row],
+            length[row],
+            lct_left[row],
+            lct_right[row],
+            lct_parent[row],
+            lct_value[row],
+            lct_lazy[row],
+            lct_lazy_valid[row],
+            lct_stack[row],
+            int(last[row]),
+            int(size[row]),
+            int(edge_count[row]),
+        )
+        output[row] = prediction
+        last[row] = new_last
+        size[row] = new_size
+        edge_count[row] = new_edge_count
+        positions[row] = position + 1
+    return output
+
+
+@njit(cache=True, nogil=True)
 def _replay_kernel(  # pragma: no cover - executed as compiled Numba code
     tokens: np.ndarray,
     history: np.ndarray,

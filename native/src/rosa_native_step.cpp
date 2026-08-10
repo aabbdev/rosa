@@ -42,10 +42,31 @@ public:
     edge_capacity_ = edge_token_.shape(1);
     hash_capacity_ = hash_state_.shape(1);
     validate_shapes();
+    positions_ = py::array_t<int64_t>(batch_);
+    std::fill(positions_.mutable_data(), positions_.mutable_data() + batch_,
+              position_);
+    if (py::hasattr(state_, "positions")) {
+      ragged_mode_ = true;
+      py::object object = state_.attr("positions");
+      if (!py::isinstance<py::array_t<int64_t>>(object))
+        throw py::type_error("positions has an unexpected dtype");
+      positions_ = py::cast<py::array_t<int64_t, py::array::c_style>>(object);
+      if (!positions_.writeable() || !vector_shape(positions_, batch_))
+        throw py::value_error("positions must be writable contiguous int64 [batch_size]");
+    }
+    occupied_slots_.resize(batch_);
+    for (int64_t b = 0; b < batch_; ++b) {
+      for (int64_t slot = 0; slot < hash_capacity_; ++slot) {
+        if (hash_state_.data()[idx(b, hash_capacity_, slot)] != -1)
+          occupied_slots_[b].push_back(static_cast<int32_t>(slot));
+      }
+    }
   }
 
   py::array_t<int64_t>
   step(py::array_t<int64_t, py::array::c_style | py::array::forcecast> tokens) {
+    if (ragged_mode_)
+      throw std::runtime_error("uniform step is unavailable on a ragged state");
     if (tokens.ndim() != 1 || tokens.shape(0) != batch_) {
       throw py::value_error("tokens must be contiguous int64 [batch_size]");
     }
@@ -58,14 +79,66 @@ public:
     {
       py::gil_scoped_release release;
       for (int64_t b = 0; b < batch_; ++b)
-        out[b] = step_row(b, in[b]);
+        out[b] = step_row(b, in[b], position_);
     }
     ++position_;
+    std::fill(positions_.mutable_data(), positions_.mutable_data() + batch_,
+              position_);
     state_.attr("position") = py::int_(position_);
     return output;
   }
 
+  py::array_t<int64_t> step_masked(py::array tokens_object,
+                                   py::array active_object,
+                                   py::array reset_object) {
+    if (!ragged_mode_)
+      throw std::runtime_error("step_masked requires a ragged state");
+    auto tokens = checked_vector<int64_t>(tokens_object, "tokens", "int64");
+    const bool active_bool = py::isinstance<py::array_t<bool>>(active_object);
+    const bool active_u8 = py::isinstance<py::array_t<uint8_t>>(active_object);
+    const bool reset_bool = py::isinstance<py::array_t<bool>>(reset_object);
+    const bool reset_u8 = py::isinstance<py::array_t<uint8_t>>(reset_object);
+    if ((!active_bool && !active_u8) || (!reset_bool && !reset_u8))
+      throw py::type_error("active and reset must have dtype bool or uint8");
+    if ((active_object.flags() & py::array::c_style) == 0 ||
+        (reset_object.flags() & py::array::c_style) == 0 ||
+        active_object.ndim() != 1 || reset_object.ndim() != 1 ||
+        active_object.shape(0) != batch_ || reset_object.shape(0) != batch_)
+      throw py::value_error(
+          "active and reset must be contiguous [batch_size]");
+    std::vector<uint8_t> active(batch_), reset(batch_);
+    for (int64_t b = 0; b < batch_; ++b) {
+      active[b] = active_bool
+                      ? static_cast<const bool *>(active_object.data())[b]
+                      : static_cast<const uint8_t *>(active_object.data())[b] != 0;
+      reset[b] = reset_bool
+                     ? static_cast<const bool *>(reset_object.data())[b]
+                     : static_cast<const uint8_t *>(reset_object.data())[b] != 0;
+    }
+    for (int64_t b = 0; b < batch_; ++b) {
+      if (active[b] && !reset[b] && positions_.data()[b] >= max_length_)
+        throw std::runtime_error("inference state capacity exceeded");
+    }
+    py::array_t<int64_t> output(batch_);
+    std::fill(output.mutable_data(), output.mutable_data() + batch_, int64_t{-1});
+    {
+      py::gil_scoped_release release;
+      for (int64_t b = 0; b < batch_; ++b) {
+        if (!active[b])
+          continue;
+        if (reset[b])
+          reset_row(b);
+        const int64_t position = positions_.data()[b];
+        output.mutable_data()[b] = step_row(b, tokens.data()[b], position);
+        positions_.mutable_data()[b] = position + 1;
+      }
+    }
+    return output;
+  }
+
   py::array_t<int64_t> prefill(py::array tokens_object) {
+    if (ragged_mode_)
+      throw std::runtime_error("prefill is unavailable on a ragged state");
     if (!py::isinstance<py::array_t<int64_t>>(tokens_object)) {
       throw py::type_error("tokens must have dtype int64");
     }
@@ -98,13 +171,28 @@ public:
       }
     }
     position_ = token_count;
+    std::fill(positions_.mutable_data(), positions_.mutable_data() + batch_,
+              position_);
     state_.attr("position") = py::int_(position_);
     return output;
   }
 
   int64_t position() const { return position_; }
+  py::array_t<int64_t> positions() const { return positions_; }
 
 private:
+  template <typename T>
+  py::array_t<T, py::array::c_style>
+  checked_vector(py::array object, const char *name, const char *dtype) const {
+    if (!py::isinstance<py::array_t<T>>(object))
+      throw py::type_error(std::string(name) + " must have dtype " + dtype);
+    if ((object.flags() & py::array::c_style) == 0 || object.ndim() != 1 ||
+        object.shape(0) != batch_)
+      throw py::value_error(std::string(name) +
+                            " must be contiguous [batch_size]");
+    return py::cast<py::array_t<T, py::array::c_style>>(object);
+  }
+
   template <typename T>
   py::array_t<T, py::array::c_style> bind(const char *name) {
     py::object object = state_.attr(name);
@@ -227,7 +315,31 @@ private:
     hs[at] = state;
     ht[at] = token;
     he[at] = count;
+    occupied_slots_[b].push_back(static_cast<int32_t>(slot));
     return count + 1;
+  }
+
+  void reset_row(int64_t b) {
+    const int32_t used_states = size_.data()[b];
+    for (int32_t state = 0; state < used_states; ++state) {
+      const int64_t at = idx(b, state_capacity_, state);
+      head_.mutable_data()[at] = -1;
+      suffix_link_.mutable_data()[at] = -1;
+      length_.mutable_data()[at] = 0;
+      left_.mutable_data()[at] = -1;
+      right_.mutable_data()[at] = -1;
+      parent_.mutable_data()[at] = -1;
+      value_.mutable_data()[at] = -1;
+      lazy_valid_.mutable_data()[at] = 0;
+    }
+    for (const int32_t slot : occupied_slots_[b]) {
+      hash_state_.mutable_data()[idx(b, hash_capacity_, slot)] = -1;
+    }
+    occupied_slots_[b].clear();
+    last_.mutable_data()[b] = 0;
+    size_.mutable_data()[b] = 1;
+    edge_count_.mutable_data()[b] = 0;
+    positions_.mutable_data()[b] = 0;
   }
 
   void replace_transition(int64_t b, int32_t state, int64_t token,
@@ -353,12 +465,12 @@ private:
     parent_.mutable_data()[idx(b, state_capacity_, node)] = represented_parent;
   }
 
-  int64_t step_row(int64_t b, int64_t token) {
+  int64_t step_row(int64_t b, int64_t token, int64_t position) {
     int32_t *last_a = last_.mutable_data();
     int32_t *size_a = size_.mutable_data();
     int32_t *edge_count_a = edge_count_.mutable_data();
     int32_t last = last_a[b], size = size_a[b], edge_count = edge_count_a[b];
-    history_.mutable_data()[idx(b, max_length_, position_)] = token;
+    history_.mutable_data()[idx(b, max_length_, position)] = token;
     if (size >= state_capacity_)
       throw std::runtime_error("state capacity exceeded");
     const int32_t current = size++;
@@ -426,7 +538,7 @@ private:
     int64_t prediction = -1;
     if (source >= 0)
       prediction = history_.data()[idx(b, max_length_, source + 1)];
-    path_assign(b, current, position_);
+    path_assign(b, current, position);
     last_a[b] = last;
     size_a[b] = size;
     edge_count_a[b] = edge_count;
@@ -665,6 +777,9 @@ private:
       hash_state_, hash_edge_, suffix_link_, length_, left_, right_, parent_,
       stack_, last_, size_, edge_count_;
   py::array_t<uint8_t, py::array::c_style> lazy_valid_;
+  py::array_t<int64_t, py::array::c_style> positions_;
+  std::vector<std::vector<int32_t>> occupied_slots_;
+  bool ragged_mode_ = false;
   int64_t batch_, max_length_, position_, state_capacity_, edge_capacity_,
       hash_capacity_;
 };
@@ -674,6 +789,8 @@ PYBIND11_MODULE(rosa_native_step, m) {
   py::class_<NativeState>(m, "NativeState")
       .def(py::init<py::object>(), py::keep_alive<1, 2>())
       .def("step", &NativeState::step)
+      .def("step_masked", &NativeState::step_masked)
       .def("prefill", &NativeState::prefill)
-      .def_property_readonly("position", &NativeState::position);
+      .def_property_readonly("position", &NativeState::position)
+      .def_property_readonly("positions", &NativeState::positions);
 }
