@@ -10,6 +10,18 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: PyTorch",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 authors = [
     { name = "Lucas", email = "30107107+aabbdev@users.noreply.github.com" },
 ]
@@ -17,6 +29,7 @@ dependencies = ["torch"]
 
 [project.urls]
 Repository = "https://github.com/aabbdev/rosa"
+Issues = "https://github.com/aabbdev/rosa/issues"
 
 [dependency-groups]
 dev = [

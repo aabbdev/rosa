@@ -38,6 +38,12 @@ The virtual-candidate branch and neural value residual have independent curricul
 - PyTorch
 - `coverage`, Ruff, and Pyright for development
 
+Install the published package from PyPI:
+
+```bash
+uv add rosa-torch
+```
+
 Install the package and its locked development dependencies with [uv](https://docs.astral.sh/uv/):
 
 ```bash
