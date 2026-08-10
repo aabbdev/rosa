@@ -513,6 +513,53 @@ def _step_batch_kernel(  # pragma: no cover - executed as compiled Numba code
     return output
 
 
+@njit(cache=True, nogil=True)
+def _replay_kernel(  # pragma: no cover - executed as compiled Numba code
+    tokens: np.ndarray,
+    history: np.ndarray,
+    head: np.ndarray,
+    edge_token: np.ndarray,
+    edge_target: np.ndarray,
+    edge_next: np.ndarray,
+    suffix_link: np.ndarray,
+    length: np.ndarray,
+    lct_left: np.ndarray,
+    lct_right: np.ndarray,
+    lct_parent: np.ndarray,
+    lct_value: np.ndarray,
+    lct_lazy: np.ndarray,
+    lct_lazy_valid: np.ndarray,
+    lct_stack: np.ndarray,
+    last: np.ndarray,
+    size: np.ndarray,
+    edge_count: np.ndarray,
+) -> np.ndarray:
+    output = np.empty(tokens.shape, dtype=np.int64)
+    for position in range(tokens.shape[1]):
+        output[:, position] = _step_batch_kernel(
+            tokens[:, position],
+            position,
+            history,
+            head,
+            edge_token,
+            edge_target,
+            edge_next,
+            suffix_link,
+            length,
+            lct_left,
+            lct_right,
+            lct_parent,
+            lct_value,
+            lct_lazy,
+            lct_lazy_valid,
+            lct_stack,
+            last,
+            size,
+            edge_count,
+        )
+    return output
+
+
 @dataclass
 class _StatefulInferenceState:
     """Fixed-capacity, independently batched exact ROSA inference state."""
@@ -628,7 +675,26 @@ def predict_exact_stateful(tokens: Tensor) -> Tensor:
         output = torch.empty(tokens.shape, dtype=torch.long, device=device)
         return output[0] if squeeze else output
     state = _init_inference_state(batch_size, length)
-    output = torch.empty(tokens.shape, dtype=torch.long, device=device)
-    for position in range(length):
-        output[:, position] = _forward_step(state, tokens[:, position])
+    cpu_tokens = tokens.detach().to(device="cpu", dtype=torch.long).contiguous()
+    output_array = _replay_kernel(
+        cpu_tokens.numpy(),
+        state.history,
+        state.head,
+        state.edge_token,
+        state.edge_target,
+        state.edge_next,
+        state.suffix_link,
+        state.length,
+        state.lct_left,
+        state.lct_right,
+        state.lct_parent,
+        state.lct_value,
+        state.lct_lazy,
+        state.lct_lazy_valid,
+        state.lct_stack,
+        state.last,
+        state.size,
+        state.edge_count,
+    )
+    output = torch.from_numpy(output_array).to(device)
     return output[0] if squeeze else output
