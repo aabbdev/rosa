@@ -45,6 +45,7 @@ class TestStatefulCandidates(unittest.TestCase):
             suffix_k=suffix_k,
             occurrences_r=occurrences_r,
         )
+        state.native_state = False
         steps: list[CandidateStep] = []
         boundary = tokens.shape[1] if split_at is None else split_at
         for position in range(boundary):

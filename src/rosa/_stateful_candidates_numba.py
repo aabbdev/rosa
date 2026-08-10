@@ -10,6 +10,7 @@ frequency deltas are added.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import torch
@@ -749,6 +750,7 @@ def _step_batch_kernel(
 class CandidateState:
     """Fixed-capacity tensor state for exact online hard candidates."""
 
+    native_candidate_abi_version: int
     batch_size: int
     max_length: int
     suffix_k: int
@@ -777,6 +779,7 @@ class CandidateState:
     last: np.ndarray
     size: np.ndarray
     edge_count: np.ndarray
+    native_state: Any
 
 
 @dataclass(frozen=True)
@@ -819,6 +822,7 @@ def init_candidate_state(
     hash_shape = (batch_size, hash_capacity)
     occurrence_shape = (batch_size, max_states, occurrences_r)
     return CandidateState(
+        native_candidate_abi_version=1,
         batch_size=batch_size,
         max_length=max_length,
         suffix_k=suffix_k,
@@ -847,6 +851,7 @@ def init_candidate_state(
         last=np.zeros(batch_size, dtype=np.int32),
         size=np.ones(batch_size, dtype=np.int32),
         edge_count=np.zeros(batch_size, dtype=np.int32),
+        native_state=None,
     )
 
 
@@ -857,6 +862,26 @@ _INTEGER_DTYPES = {
     torch.int32,
     torch.int64,
 }
+
+
+def _native_candidate_step(  # pragma: no cover - optional native companion
+    state: CandidateState,
+    cpu_tokens: Tensor,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    if state.native_state is False:
+        return None
+    if state.native_state is None:
+        try:
+            import rosa_native_step  # type: ignore[reportMissingImports]
+        except ModuleNotFoundError:
+            state.native_state = False
+            return None
+        native_type = getattr(rosa_native_step, "NativeCandidateState", None)
+        if native_type is None:
+            state.native_state = False
+            return None
+        state.native_state = native_type(state)
+    return state.native_state.step(cpu_tokens.numpy())
 
 
 def forward_candidates_step(state: CandidateState, tokens: Tensor) -> CandidateStep:
@@ -877,36 +902,40 @@ def forward_candidates_step(state: CandidateState, tokens: Tensor) -> CandidateS
 
     device = tokens.device
     cpu_tokens = tokens.detach().to(device="cpu", dtype=torch.long).contiguous()
-    source, match_length, state_id, frequency, count = _step_batch_kernel(
-        cpu_tokens.numpy(),
-        state.position,
-        state.suffix_k,
-        state.occurrences_r,
-        state.history,
-        state.head,
-        state.edge_token,
-        state.edge_target,
-        state.edge_next,
-        state.hash_state,
-        state.hash_token,
-        state.hash_edge,
-        state.suffix_link,
-        state.length,
-        state.lct_left,
-        state.lct_right,
-        state.lct_parent,
-        state.occurrences,
-        state.occurrence_size,
-        state.frequency,
-        state.lazy_prefix,
-        state.lazy_size,
-        state.lazy_delta,
-        state.lct_stack,
-        state.last,
-        state.size,
-        state.edge_count,
-    )
-    state.position += 1
+    native_output = _native_candidate_step(state, cpu_tokens)
+    if native_output is None:
+        source, match_length, state_id, frequency, count = _step_batch_kernel(
+            cpu_tokens.numpy(),
+            state.position,
+            state.suffix_k,
+            state.occurrences_r,
+            state.history,
+            state.head,
+            state.edge_token,
+            state.edge_target,
+            state.edge_next,
+            state.hash_state,
+            state.hash_token,
+            state.hash_edge,
+            state.suffix_link,
+            state.length,
+            state.lct_left,
+            state.lct_right,
+            state.lct_parent,
+            state.occurrences,
+            state.occurrence_size,
+            state.frequency,
+            state.lazy_prefix,
+            state.lazy_size,
+            state.lazy_delta,
+            state.lct_stack,
+            state.last,
+            state.size,
+            state.edge_count,
+        )
+        state.position += 1
+    else:
+        source, match_length, state_id, frequency, count = native_output
 
     slots = state.suffix_k * state.occurrences_r
     slot_index = np.arange(slots, dtype=np.int32)[None, :]

@@ -15,6 +15,19 @@ PyTorch, NumPy et Numba.
 Le constructeur valide intégralement formes, types, compteurs et version ABI
 avant de conserver les pointeurs. L'ABI d'état native actuelle vaut `1`.
 
+Le module expose aussi `NativeCandidateState` pour l'état riche exact de
+`rosa._stateful_candidates_numba`. Son `step` batch maintient les mêmes K
+suffixes, R occurrences les plus récentes, fréquences non bornées et tags LCT
+`newest-prefix + delta`. La capacité R reste possédée par les tableaux NumPy du
+`CandidateState` Python, dont l'objet natif conserve la durée de vie. La
+capacité peut être détectée via la présence de `NativeCandidateState` et
+`candidate_abi_version == 1`.
+
+Cette première ABI riche expose `step`, `reset` global et `position`. Elle
+n'expose pas encore de préremplissage riche ni de reset/continuation masqué par
+ligne; ces opérations nécessitent un contrat de positions par ligne distinct
+de `CandidateState.position`.
+
 ## Installation et utilisation
 
 Installez un wheel correspondant à la version de Python et à la plateforme :
@@ -33,6 +46,11 @@ from rosa_native_step import NativeState
 `NativeState(state).step(tokens_numpy)` attend un vecteur NumPy contigu
 convertible en `int64`, de forme `[batch_size]`. L'objet conserve une référence
 à l'état Python et expose sa `position` en lecture seule.
+
+`NativeCandidateState(candidate_state).step(tokens_numpy)` attend strictement
+un vecteur NumPy C-contigu `int64` et renvoie le tuple bas niveau
+`(source, match_length, state_id, frequency, count)`. `reset()` recycle tout le
+batch en temps proportionnel aux états et slots de hachage réellement occupés.
 
 ## Construction locale isolée
 
@@ -53,6 +71,10 @@ uv run --isolated \
 
 Le smoke force Numba comme oracle, laisse le chemin ROSA courant charger le
 compagnon, puis compare les prédictions étape par étape.
+
+Le smoke riche et le benchmark direct contre Numba se lancent respectivement
+avec `native/tests/candidate_smoke.py` et `native/benchmark_candidates.py` dans
+le même environnement isolé.
 
 ## Publication multi-plateforme
 

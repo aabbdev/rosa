@@ -390,6 +390,85 @@ def build_hard_candidates(
     )
 
 
+CandidateBackend = Literal["auto", "python", "stateful"]
+
+
+def _build_stateful_hard_candidates(
+    tokens: Tensor,
+    suffix_k: int,
+    occurrences_r: int,
+) -> HardCandidates:
+    """Replay a full sequence through the exact bounded stateful backend."""
+
+    from ._stateful_candidates_numba import forward_candidates_step as step
+    from ._stateful_candidates_numba import init_candidate_state as initialize
+
+    cpu_tokens = tokens.detach().to(device="cpu", dtype=torch.long).contiguous()
+    batch_size, sequence_length = cpu_tokens.shape
+    state = initialize(
+        batch_size,
+        sequence_length,
+        suffix_k=suffix_k,
+        occurrences_r=occurrences_r,
+    )
+    steps = [
+        step(state, cpu_tokens[:, position]) for position in range(sequence_length)
+    ]
+    stacked = {
+        name: torch.stack([getattr(item, name) for item in steps], dim=1)
+        for name in HardCandidates.__dataclass_fields__
+    }
+    candidate_fields = torch.stack(
+        [
+            stacked["source_index"],
+            stacked["match_length"],
+            stacked["state_id"],
+            stacked["frequency"],
+        ]
+    ).to(tokens.device)
+    rosa_fields = torch.stack(
+        [
+            stacked["rosa_slot"],
+            stacked["rosa_source_index"],
+            stacked["rosa_match_length"],
+            stacked["rosa_predicted_tokens"],
+        ]
+    ).to(tokens.device)
+    return HardCandidates(
+        source_index=candidate_fields[0],
+        match_length=candidate_fields[1],
+        state_id=candidate_fields[2],
+        frequency=candidate_fields[3],
+        mask=stacked["mask"].to(tokens.device),
+        rosa_slot=rosa_fields[0],
+        rosa_source_index=rosa_fields[1],
+        rosa_match_length=rosa_fields[2],
+        rosa_predicted_tokens=rosa_fields[3],
+    )
+
+
+def _build_forward_hard_candidates(
+    tokens: Tensor,
+    suffix_k: int,
+    occurrences_r: int,
+    backend: CandidateBackend,
+) -> HardCandidates:
+    """Dispatch ROSA forward candidates without weakening backend failures."""
+
+    if backend == "python":
+        return build_hard_candidates(tokens, suffix_k, occurrences_r)
+    try:
+        return _build_stateful_hard_candidates(tokens, suffix_k, occurrences_r)
+    except ModuleNotFoundError as error:
+        if error.name not in {"numba", "numpy"}:
+            raise
+        if backend == "stateful":
+            raise RuntimeError(
+                "stateful candidate backend requires the 'numba' extra"
+            ) from error
+        return build_hard_candidates(tokens, suffix_k, occurrences_r)
+
+
 def _virtual_pool_single(i: int, pool_size: int) -> list[int]:
     """Causal bounded pool: half recent positions, half history anchors."""
 
@@ -512,6 +591,7 @@ class ROSA(nn.Module):
         learned_residual_scale: float = 0.0,
         virtual_scale: float = 0.0,
         neural_value_scale: float = 0.0,
+        candidate_backend: CandidateBackend = "auto",
     ) -> None:
         super().__init__()
         if d_model <= 0:
@@ -546,6 +626,10 @@ class ROSA(nn.Module):
             raise ValueError("virtual_scale must be in [0, 1]")
         if not 0.0 <= neural_value_scale <= 1.0:
             raise ValueError("neural_value_scale must be in [0, 1]")
+        if candidate_backend not in {"auto", "python", "stateful"}:
+            raise ValueError(
+                "candidate_backend must be 'auto', 'python', or 'stateful'"
+            )
 
         self.d_model = d_model
         self.codebook_sizes = (int(codebook_sizes[0]), int(codebook_sizes[1]))
@@ -558,6 +642,7 @@ class ROSA(nn.Module):
         self.sparse_old_candidates = sparse_old_candidates
         self.sparse_old_pool_size = sparse_old_pool_size
         self.soft_candidates_forward = soft_candidates_forward
+        self.candidate_backend: CandidateBackend = candidate_backend
         self.selector_dim = selector_dim
         self.token_temperature = token_temperature
         self.retrieval_temperature = retrieval_temperature
@@ -804,10 +889,11 @@ class ROSA(nn.Module):
         # Keep the exact, non-differentiable automaton on CPU as proposed for
         # RWKV-8 ROSA. Accelerator backends may optimize the tensor path around
         # it, but must not silently replace this exact discrete control path.
-        hard = build_hard_candidates(
+        hard = _build_forward_hard_candidates(
             hard_tokens,
-            suffix_k=self.suffix_k,
-            occurrences_r=self.occurrences_r,
+            self.suffix_k,
+            self.occurrences_r,
+            self.candidate_backend,
         )
         exact_source = hard.source_index
         exact_mask = hard.mask

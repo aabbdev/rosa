@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import copy
 import random
 import unittest
+from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
 
+import rosa
 from rosa import (
     NULL_KIND,
     ROSA,
     VIRTUAL_KIND,
     _balance_kl,
+    _build_forward_hard_candidates,
     _gather_sequence,
     _st_categorical,
     _virtual_pool_single,
@@ -195,6 +199,7 @@ class TestROSAConfiguration(unittest.TestCase):
             (dict(d_model=4, learned_residual_scale=-0.1), "learned_residual_scale"),
             (dict(d_model=4, virtual_scale=1.1), "virtual_scale"),
             (dict(d_model=4, neural_value_scale=2.0), "neural_value_scale"),
+            (dict(d_model=4, candidate_backend="invalid"), "candidate_backend"),
         ]
         for kwargs, pattern in invalid_calls:
             with (
@@ -265,6 +270,143 @@ class TestROSASemantics(unittest.TestCase):
         )
         kwargs.update(overrides)
         return ROSA(**kwargs)
+
+    def assert_nested_equal(self, actual, expected, name: str) -> None:
+        if isinstance(actual, torch.Tensor):
+            self.assertTrue(torch.equal(actual, expected), name)
+        elif isinstance(actual, tuple):
+            self.assertEqual(len(actual), len(expected), name)
+            for index, (actual_item, expected_item) in enumerate(
+                zip(actual, expected, strict=True)
+            ):
+                self.assert_nested_equal(actual_item, expected_item, f"{name}[{index}]")
+        elif isinstance(actual, dict):
+            self.assertEqual(actual.keys(), expected.keys(), name)
+            for key in actual:
+                self.assert_nested_equal(actual[key], expected[key], f"{name}.{key}")
+        else:
+            self.assertEqual(actual, expected, name)
+
+    def test_python_and_stateful_backends_match_all_fields_outputs_and_gradients(
+        self,
+    ) -> None:
+        torch.manual_seed(20260811)
+        tokens = torch.randint(6, (2, 13))
+        eager_hard = _build_forward_hard_candidates(tokens, 4, 3, "python")
+        stateful_hard = _build_forward_hard_candidates(tokens, 4, 3, "stateful")
+        for name in eager_hard.__dataclass_fields__:
+            self.assertTrue(
+                torch.equal(getattr(eager_hard, name), getattr(stateful_hard, name)),
+                name,
+            )
+
+        python_model = self.make_model(
+            candidate_backend="python",
+            learned_residual_scale=1.0,
+            neural_value_scale=1.0,
+        )
+        stateful_model = copy.deepcopy(python_model)
+        stateful_model.candidate_backend = "stateful"
+        z_python = torch.randn(2, 13, 8, requires_grad=True)
+        z_stateful = z_python.detach().clone().requires_grad_()
+        logits_python = factor_logits_from_tokens(
+            tokens, (2, 3), hi=0.2, lo=-0.1, requires_grad=True
+        )
+        logits_stateful = tuple(
+            item.detach().clone().requires_grad_() for item in logits_python
+        )
+        python_output = python_model(z_python, code_logits=logits_python)
+        stateful_output = stateful_model(z_stateful, code_logits=logits_stateful)
+        for name in python_output.__dataclass_fields__:
+            self.assert_nested_equal(
+                getattr(stateful_output, name), getattr(python_output, name), name
+            )
+
+        python_loss = python_output.updated.square().mean() + sum(
+            python_output.aux_losses.values()
+        )
+        stateful_loss = stateful_output.updated.square().mean() + sum(
+            stateful_output.aux_losses.values()
+        )
+        python_loss.backward()
+        stateful_loss.backward()
+        assert z_stateful.grad is not None
+        assert z_python.grad is not None
+        self.assertTrue(torch.equal(z_stateful.grad, z_python.grad))
+        for actual, expected in zip(logits_stateful, logits_python, strict=True):
+            assert actual.grad is not None
+            assert expected.grad is not None
+            self.assertTrue(torch.equal(actual.grad, expected.grad))
+        for (actual_name, actual), (expected_name, expected) in zip(
+            stateful_model.named_parameters(),
+            python_model.named_parameters(),
+            strict=True,
+        ):
+            self.assertEqual(actual_name, expected_name)
+            self.assertEqual(actual.grad is None, expected.grad is None, actual_name)
+            if actual.grad is not None:
+                assert expected.grad is not None
+                self.assertTrue(torch.equal(actual.grad, expected.grad), actual_name)
+
+    def test_stateful_forward_does_not_call_eager_or_suffix_write(self) -> None:
+        tokens = torch.tensor([[0, 1, 0, 2, 0, 1]], dtype=torch.long)
+        logits = factor_logits_from_tokens(tokens, (2, 3))
+        expected = _build_forward_hard_candidates(tokens, 3, 2, "python")
+        model = self.make_model(
+            suffix_k=3,
+            occurrences_r=2,
+            candidate_backend="stateful",
+        )
+        with (
+            patch("rosa.build_hard_candidates", side_effect=AssertionError("eager")),
+            patch.object(
+                rosa._OnlineSuffixAutomaton,
+                "write_current_end",
+                side_effect=AssertionError("suffix write"),
+            ),
+        ):
+            hard = _build_forward_hard_candidates(tokens, 3, 2, "stateful")
+            output = model(torch.randn(1, 6, 8), code_logits=logits)
+        for name in expected.__dataclass_fields__:
+            self.assertTrue(
+                torch.equal(getattr(hard, name), getattr(expected, name)), name
+            )
+        self.assertTrue(
+            torch.equal(output.hard_rosa_source_index, expected.rosa_source_index)
+        )
+
+    def test_auto_fallback_is_limited_to_missing_optional_dependencies(self) -> None:
+        tokens = torch.tensor([[0, 1, 0]], dtype=torch.long)
+        expected = build_hard_candidates(tokens, 2, 2)
+        for dependency in ("numba", "numpy"):
+            missing = ModuleNotFoundError(
+                f"No module named '{dependency}'", name=dependency
+            )
+            with patch("rosa._build_stateful_hard_candidates", side_effect=missing):
+                actual = _build_forward_hard_candidates(tokens, 2, 2, "auto")
+                self.assertTrue(
+                    torch.equal(actual.source_index, expected.source_index), dependency
+                )
+                with self.assertRaisesRegex(RuntimeError, "numba.*extra"):
+                    _build_forward_hard_candidates(tokens, 2, 2, "stateful")
+
+        unrelated = ModuleNotFoundError("No module named 'other'", name="other")
+        with (
+            patch("rosa._build_stateful_hard_candidates", side_effect=unrelated),
+            self.assertRaises(ModuleNotFoundError),
+        ):
+            _build_forward_hard_candidates(tokens, 2, 2, "auto")
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
+    def test_stateful_full_sequence_matches_eager_on_cuda(self) -> None:
+        tokens = torch.randint(5, (3, 31), device="cuda")
+        expected = _build_forward_hard_candidates(tokens, 5, 3, "python")
+        actual = _build_forward_hard_candidates(tokens, 5, 3, "stateful")
+        for name in expected.__dataclass_fields__:
+            with self.subTest(name=name):
+                self.assertTrue(
+                    torch.equal(getattr(actual, name), getattr(expected, name))
+                )
 
     def test_zero_residual_is_exact_rosa_even_with_virtuals(self) -> None:
         tokens = torch.tensor(
