@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import torch
@@ -634,6 +635,7 @@ class _StatefulInferenceState:
     last: np.ndarray
     size: np.ndarray
     edge_count: np.ndarray
+    native_state: Any
 
 
 def _init_inference_state(
@@ -679,7 +681,26 @@ def _init_inference_state(
         last=np.zeros(batch_size, dtype=np.int32),
         size=np.ones(batch_size, dtype=np.int32),
         edge_count=np.zeros(batch_size, dtype=np.int32),
+        native_state=None,
     )
+
+
+def _native_step(  # pragma: no cover - optional native companion
+    state: _StatefulInferenceState,
+    cpu_tokens: Tensor,
+) -> np.ndarray | None:
+    if state.native_state is False:
+        return None
+    if state.native_state is None:
+        try:
+            from rosa_native_step import (  # type: ignore[reportMissingImports]
+                NativeState,
+            )
+        except ModuleNotFoundError:
+            state.native_state = False
+            return None
+        state.native_state = NativeState(state)
+    return state.native_state.step(cpu_tokens.numpy())
 
 
 def _forward_step(state: _StatefulInferenceState, tokens: Tensor) -> Tensor:
@@ -693,6 +714,9 @@ def _forward_step(state: _StatefulInferenceState, tokens: Tensor) -> Tensor:
         raise RuntimeError("inference state capacity exceeded")
     device = tokens.device
     cpu_tokens = tokens.detach().to(device="cpu", dtype=torch.long).contiguous()
+    native_output = _native_step(state, cpu_tokens)
+    if native_output is not None:  # pragma: no cover - optional native companion
+        return torch.from_numpy(native_output).to(device)
     output = _step_batch_kernel(
         cpu_tokens.numpy(),
         state.position,
