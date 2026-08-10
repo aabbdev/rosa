@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
-from numba import njit, prange
+from numba import njit
 from torch import Tensor
 
 
@@ -554,64 +554,6 @@ def _step_batch_kernel(  # pragma: no cover - executed as compiled Numba code
     return output
 
 
-@njit(cache=True, nogil=True, parallel=True)
-def _step_batch_parallel_kernel(  # pragma: no cover - compiled Numba code
-    tokens: np.ndarray,
-    position: int,
-    history: np.ndarray,
-    head: np.ndarray,
-    edge_token: np.ndarray,
-    edge_target: np.ndarray,
-    edge_next: np.ndarray,
-    hash_state: np.ndarray,
-    hash_token: np.ndarray,
-    hash_edge: np.ndarray,
-    suffix_link: np.ndarray,
-    length: np.ndarray,
-    lct_left: np.ndarray,
-    lct_right: np.ndarray,
-    lct_parent: np.ndarray,
-    lct_value: np.ndarray,
-    lct_lazy: np.ndarray,
-    lct_lazy_valid: np.ndarray,
-    lct_stack: np.ndarray,
-    last: np.ndarray,
-    size: np.ndarray,
-    edge_count: np.ndarray,
-) -> np.ndarray:
-    output = np.empty(tokens.shape[0], dtype=np.int64)
-    for batch_index in prange(tokens.shape[0]):
-        prediction, new_last, new_size, new_edge_count = _step_row(
-            int(tokens[batch_index]),
-            position,
-            history[batch_index],
-            head[batch_index],
-            edge_token[batch_index],
-            edge_target[batch_index],
-            edge_next[batch_index],
-            hash_state[batch_index],
-            hash_token[batch_index],
-            hash_edge[batch_index],
-            suffix_link[batch_index],
-            length[batch_index],
-            lct_left[batch_index],
-            lct_right[batch_index],
-            lct_parent[batch_index],
-            lct_value[batch_index],
-            lct_lazy[batch_index],
-            lct_lazy_valid[batch_index],
-            lct_stack[batch_index],
-            int(last[batch_index]),
-            int(size[batch_index]),
-            int(edge_count[batch_index]),
-        )
-        output[batch_index] = prediction
-        last[batch_index] = new_last
-        size[batch_index] = new_size
-        edge_count[batch_index] = new_edge_count
-    return output
-
-
 @njit(cache=True, nogil=True)
 def _replay_kernel(  # pragma: no cover - executed as compiled Numba code
     tokens: np.ndarray,
@@ -751,10 +693,7 @@ def _forward_step(state: _StatefulInferenceState, tokens: Tensor) -> Tensor:
         raise RuntimeError("inference state capacity exceeded")
     device = tokens.device
     cpu_tokens = tokens.detach().to(device="cpu", dtype=torch.long).contiguous()
-    step_kernel = (
-        _step_batch_parallel_kernel if state.batch_size >= 8 else _step_batch_kernel
-    )
-    output = step_kernel(
+    output = _step_batch_kernel(
         cpu_tokens.numpy(),
         state.position,
         state.history,
