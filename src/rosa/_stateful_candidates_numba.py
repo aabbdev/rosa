@@ -746,6 +746,212 @@ def _step_batch_kernel(
     return source, match_length, state_id, candidate_frequency, count
 
 
+@njit(cache=True, nogil=True)
+def _reset_candidate_rows_kernel(
+    reset: np.ndarray,
+    head: np.ndarray,
+    hash_state: np.ndarray,
+    suffix_link: np.ndarray,
+    length: np.ndarray,
+    lct_left: np.ndarray,
+    lct_right: np.ndarray,
+    lct_parent: np.ndarray,
+    occurrence_size: np.ndarray,
+    frequency: np.ndarray,
+    lazy_size: np.ndarray,
+    lazy_delta: np.ndarray,
+    last: np.ndarray,
+    size: np.ndarray,
+    edge_count: np.ndarray,
+    positions: np.ndarray,
+) -> None:  # pragma: no cover - executed as compiled Numba code
+    for batch_index in range(reset.shape[0]):
+        if not reset[batch_index]:
+            continue
+        used_states = int(size[batch_index])
+        for node in range(used_states):
+            head[batch_index, node] = -1
+            suffix_link[batch_index, node] = -1
+            length[batch_index, node] = 0
+            lct_left[batch_index, node] = -1
+            lct_right[batch_index, node] = -1
+            lct_parent[batch_index, node] = -1
+            occurrence_size[batch_index, node] = 0
+            frequency[batch_index, node] = 0
+            lazy_size[batch_index, node] = 0
+            lazy_delta[batch_index, node] = 0
+        for slot in range(hash_state.shape[1]):
+            hash_state[batch_index, slot] = -1
+        last[batch_index] = 0
+        size[batch_index] = 1
+        edge_count[batch_index] = 0
+        positions[batch_index] = 0
+
+
+@njit(cache=True, nogil=True)
+def _step_masked_batch_kernel(
+    tokens: np.ndarray,
+    active: np.ndarray,
+    positions: np.ndarray,
+    suffix_k: int,
+    occurrences_r: int,
+    history: np.ndarray,
+    head: np.ndarray,
+    edge_token: np.ndarray,
+    edge_target: np.ndarray,
+    edge_next: np.ndarray,
+    hash_state: np.ndarray,
+    hash_token: np.ndarray,
+    hash_edge: np.ndarray,
+    suffix_link: np.ndarray,
+    length: np.ndarray,
+    lct_left: np.ndarray,
+    lct_right: np.ndarray,
+    lct_parent: np.ndarray,
+    occurrences: np.ndarray,
+    occurrence_size: np.ndarray,
+    frequency: np.ndarray,
+    lazy_prefix: np.ndarray,
+    lazy_size: np.ndarray,
+    lazy_delta: np.ndarray,
+    lct_stack: np.ndarray,
+    last: np.ndarray,
+    size: np.ndarray,
+    edge_count: np.ndarray,
+) -> tuple[
+    np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray
+]:  # pragma: no cover
+    slots = suffix_k * occurrences_r
+    batch_size = tokens.shape[0]
+    source = np.full((batch_size, slots), -1, dtype=np.int64)
+    match_length = np.zeros((batch_size, slots), dtype=np.int64)
+    state_id = np.full((batch_size, slots), -1, dtype=np.int64)
+    candidate_frequency = np.zeros((batch_size, slots), dtype=np.int64)
+    count = np.zeros(batch_size, dtype=np.int32)
+    for batch_index in range(batch_size):
+        if not active[batch_index]:
+            continue
+        row_count, row_last, row_size, row_edge_count = _step_row(
+            int(tokens[batch_index]),
+            int(positions[batch_index]),
+            suffix_k,
+            occurrences_r,
+            history[batch_index],
+            head[batch_index],
+            edge_token[batch_index],
+            edge_target[batch_index],
+            edge_next[batch_index],
+            hash_state[batch_index],
+            hash_token[batch_index],
+            hash_edge[batch_index],
+            suffix_link[batch_index],
+            length[batch_index],
+            lct_left[batch_index],
+            lct_right[batch_index],
+            lct_parent[batch_index],
+            occurrences[batch_index],
+            occurrence_size[batch_index],
+            frequency[batch_index],
+            lazy_prefix[batch_index],
+            lazy_size[batch_index],
+            lazy_delta[batch_index],
+            lct_stack[batch_index],
+            int(last[batch_index]),
+            int(size[batch_index]),
+            int(edge_count[batch_index]),
+            source[batch_index],
+            match_length[batch_index],
+            state_id[batch_index],
+            candidate_frequency[batch_index],
+        )
+        count[batch_index] = row_count
+        last[batch_index] = row_last
+        size[batch_index] = row_size
+        edge_count[batch_index] = row_edge_count
+        positions[batch_index] += 1
+    return source, match_length, state_id, candidate_frequency, count
+
+
+@njit(cache=True, nogil=True)
+def _prefill_candidate_kernel(
+    tokens: np.ndarray,
+    suffix_k: int,
+    occurrences_r: int,
+    history: np.ndarray,
+    head: np.ndarray,
+    edge_token: np.ndarray,
+    edge_target: np.ndarray,
+    edge_next: np.ndarray,
+    hash_state: np.ndarray,
+    hash_token: np.ndarray,
+    hash_edge: np.ndarray,
+    suffix_link: np.ndarray,
+    length: np.ndarray,
+    lct_left: np.ndarray,
+    lct_right: np.ndarray,
+    lct_parent: np.ndarray,
+    occurrences: np.ndarray,
+    occurrence_size: np.ndarray,
+    frequency: np.ndarray,
+    lazy_prefix: np.ndarray,
+    lazy_size: np.ndarray,
+    lazy_delta: np.ndarray,
+    lct_stack: np.ndarray,
+    last: np.ndarray,
+    size: np.ndarray,
+    edge_count: np.ndarray,
+) -> tuple[
+    np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray
+]:  # pragma: no cover
+    batch_size, sequence_length = tokens.shape
+    slots = suffix_k * occurrences_r
+    source = np.full((batch_size, sequence_length, slots), -1, dtype=np.int64)
+    match_length = np.zeros((batch_size, sequence_length, slots), dtype=np.int64)
+    state_id = np.full((batch_size, sequence_length, slots), -1, dtype=np.int64)
+    candidate_frequency = np.zeros((batch_size, sequence_length, slots), dtype=np.int64)
+    count = np.zeros((batch_size, sequence_length), dtype=np.int32)
+    for position in range(sequence_length):
+        for batch_index in range(batch_size):
+            row_count, row_last, row_size, row_edge_count = _step_row(
+                int(tokens[batch_index, position]),
+                position,
+                suffix_k,
+                occurrences_r,
+                history[batch_index],
+                head[batch_index],
+                edge_token[batch_index],
+                edge_target[batch_index],
+                edge_next[batch_index],
+                hash_state[batch_index],
+                hash_token[batch_index],
+                hash_edge[batch_index],
+                suffix_link[batch_index],
+                length[batch_index],
+                lct_left[batch_index],
+                lct_right[batch_index],
+                lct_parent[batch_index],
+                occurrences[batch_index],
+                occurrence_size[batch_index],
+                frequency[batch_index],
+                lazy_prefix[batch_index],
+                lazy_size[batch_index],
+                lazy_delta[batch_index],
+                lct_stack[batch_index],
+                int(last[batch_index]),
+                int(size[batch_index]),
+                int(edge_count[batch_index]),
+                source[batch_index, position],
+                match_length[batch_index, position],
+                state_id[batch_index, position],
+                candidate_frequency[batch_index, position],
+            )
+            count[batch_index, position] = row_count
+            last[batch_index] = row_last
+            size[batch_index] = row_size
+            edge_count[batch_index] = row_edge_count
+    return source, match_length, state_id, candidate_frequency, count
+
+
 @dataclass
 class CandidateState:
     """Fixed-capacity tensor state for exact online hard candidates."""
@@ -756,6 +962,8 @@ class CandidateState:
     suffix_k: int
     occurrences_r: int
     position: int
+    ragged_mode: bool
+    positions: np.ndarray
     history: np.ndarray
     head: np.ndarray
     edge_token: np.ndarray
@@ -803,6 +1011,7 @@ def init_candidate_state(
     *,
     suffix_k: int = 16,
     occurrences_r: int = 4,
+    ragged: bool = False,
 ) -> CandidateState:
     """Allocate an exact bounded-candidate state backed by CPU tensors."""
 
@@ -828,6 +1037,8 @@ def init_candidate_state(
         suffix_k=suffix_k,
         occurrences_r=occurrences_r,
         position=0,
+        ragged_mode=ragged,
+        positions=np.zeros(batch_size, dtype=np.int64),
         history=np.empty((batch_size, max_length), dtype=np.int64),
         head=np.full(state_shape, -1, dtype=np.int32),
         edge_token=np.empty(edge_shape, dtype=np.int64),
@@ -884,19 +1095,90 @@ def _native_candidate_step(  # pragma: no cover - optional native companion
     return state.native_state.step(cpu_tokens.numpy())
 
 
-def forward_candidates_step(state: CandidateState, tokens: Tensor) -> CandidateStep:
-    """Consume one token per row and return exact top-R candidates for K suffixes."""
+def _native_candidate_call(  # pragma: no cover - optional native companion
+    state: CandidateState,
+    method: str,
+    *args: np.ndarray,
+) -> Any | None:
+    """Call a post-ABI-1 capability, falling back for an older installed wheel."""
 
+    if state.native_state is False:
+        return None
+    if state.native_state is None:
+        try:
+            import rosa_native_step  # type: ignore[reportMissingImports]
+        except ModuleNotFoundError:
+            state.native_state = False
+            return None
+        native_type = getattr(rosa_native_step, "NativeCandidateState", None)
+        if native_type is None:
+            state.native_state = False
+            return None
+        state.native_state = native_type(state)
+    native_method = getattr(state.native_state, method, None)
+    if native_method is None:
+        state.native_state = False
+        return None
+    return native_method(*args)
+
+
+def _validate_candidate_tokens(
+    state: CandidateState, tokens: Tensor, *, sequence: bool = False
+) -> tuple[Tensor, bool]:
     if not isinstance(state, CandidateState):
         raise TypeError("state must be a CandidateState")
     if not isinstance(tokens, Tensor):
         raise TypeError("tokens must be a Tensor")
-    if tokens.ndim == 0 and state.batch_size == 1:
+    scalar = tokens.ndim == 0 and state.batch_size == 1 and not sequence
+    if scalar:
         tokens = tokens.unsqueeze(0)
-    if tokens.ndim != 1 or tokens.shape[0] != state.batch_size:
-        raise ValueError("tokens must have shape [batch_size]")
+    expected_ndim = 2 if sequence else 1
+    if tokens.ndim != expected_ndim or tokens.shape[0] != state.batch_size:
+        shape = "[batch_size, sequence_length]" if sequence else "[batch_size]"
+        raise ValueError(f"tokens must have shape {shape}")
     if tokens.dtype not in _INTEGER_DTYPES:
         raise TypeError("tokens must use an integer dtype")
+    return tokens, scalar
+
+
+def _candidate_step_from_arrays(
+    state: CandidateState,
+    arrays: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+    device: torch.device,
+) -> CandidateStep:
+    source, match_length, state_id, frequency, count = arrays
+    slots = state.suffix_k * state.occurrences_r
+    slot_shape = (1,) * count.ndim + (slots,)
+    slot_index = np.arange(slots, dtype=np.int32).reshape(slot_shape)
+    mask = slot_index < count[..., None]
+    rosa_source = source[..., 0].copy()
+    rosa_length = match_length[..., 0].copy()
+    rosa_slot = np.where(count > 0, 0, -1).astype(np.int64)
+    rosa_predicted = np.full(count.shape, -1, dtype=np.int64)
+    for index in np.ndindex(count.shape):
+        if count[index] > 0:
+            batch_index = index[0]
+            source_position = int(rosa_source[index])
+            rosa_predicted[index] = state.history[batch_index, source_position + 1]
+    return CandidateStep(
+        source_index=torch.from_numpy(source).to(device),
+        match_length=torch.from_numpy(match_length).to(device),
+        state_id=torch.from_numpy(state_id).to(device),
+        frequency=torch.from_numpy(frequency).to(device),
+        mask=torch.from_numpy(mask).to(device),
+        rosa_slot=torch.from_numpy(rosa_slot).to(device),
+        rosa_source_index=torch.from_numpy(rosa_source).to(device),
+        rosa_match_length=torch.from_numpy(rosa_length).to(device),
+        rosa_predicted_tokens=torch.from_numpy(rosa_predicted).to(device),
+    )
+
+
+def forward_candidates_step(state: CandidateState, tokens: Tensor) -> CandidateStep:
+    """Consume one token per row and return exact top-R candidates for K suffixes."""
+
+    tokens, _ = _validate_candidate_tokens(state, tokens)
+    if state.ragged_mode:
+        raise RuntimeError("uniform step is unavailable on a ragged candidate state")
     if state.position >= state.max_length:
         raise RuntimeError("candidate state capacity exceeded")
 
@@ -934,31 +1216,199 @@ def forward_candidates_step(state: CandidateState, tokens: Tensor) -> CandidateS
             state.edge_count,
         )
         state.position += 1
+        state.positions.fill(state.position)
     else:
         source, match_length, state_id, frequency, count = native_output
-
-    slots = state.suffix_k * state.occurrences_r
-    slot_index = np.arange(slots, dtype=np.int32)[None, :]
-    mask = slot_index < count[:, None]
-    rosa_source = source[:, 0].copy()
-    rosa_length = match_length[:, 0].copy()
-    rosa_slot = np.where(count > 0, 0, -1).astype(np.int64)
-    rosa_predicted = np.full(state.batch_size, -1, dtype=np.int64)
-    for batch_index in range(state.batch_size):
-        if count[batch_index] > 0:
-            source_position = int(rosa_source[batch_index])
-            rosa_predicted[batch_index] = state.history[
-                batch_index, source_position + 1
-            ]
-
-    return CandidateStep(
-        source_index=torch.from_numpy(source).to(device),
-        match_length=torch.from_numpy(match_length).to(device),
-        state_id=torch.from_numpy(state_id).to(device),
-        frequency=torch.from_numpy(frequency).to(device),
-        mask=torch.from_numpy(mask).to(device),
-        rosa_slot=torch.from_numpy(rosa_slot).to(device),
-        rosa_source_index=torch.from_numpy(rosa_source).to(device),
-        rosa_match_length=torch.from_numpy(rosa_length).to(device),
-        rosa_predicted_tokens=torch.from_numpy(rosa_predicted).to(device),
+        state.positions.fill(state.position)
+    return _candidate_step_from_arrays(
+        state, (source, match_length, state_id, frequency, count), device
     )
+
+
+def reset_candidates_masked(state: CandidateState, reset: Tensor) -> None:
+    """Reset selected ragged rows without reallocating their fixed-capacity storage."""
+
+    if not isinstance(state, CandidateState):
+        raise TypeError("state must be a CandidateState")
+    if not state.ragged_mode:
+        raise RuntimeError("reset_masked requires a ragged candidate state")
+    if not isinstance(reset, Tensor):
+        raise TypeError("reset must be a Tensor")
+    if reset.ndim == 0 and state.batch_size == 1:
+        reset = reset.unsqueeze(0)
+    if reset.ndim != 1 or reset.shape[0] != state.batch_size:
+        raise ValueError("reset must have shape [batch_size]")
+    if reset.dtype not in (torch.bool, torch.uint8):
+        raise TypeError("reset must have dtype bool or uint8")
+    cpu_reset = reset.detach().to(device="cpu", dtype=torch.bool).contiguous()
+    native = _native_candidate_call(state, "reset_masked", cpu_reset.numpy())
+    if native is None:  # pragma: no branch - native capability is optional
+        _reset_candidate_rows_kernel(
+            cpu_reset.numpy(),
+            state.head,
+            state.hash_state,
+            state.suffix_link,
+            state.length,
+            state.lct_left,
+            state.lct_right,
+            state.lct_parent,
+            state.occurrence_size,
+            state.frequency,
+            state.lazy_size,
+            state.lazy_delta,
+            state.last,
+            state.size,
+            state.edge_count,
+            state.positions,
+        )
+
+
+def forward_candidates_step_masked(
+    state: CandidateState,
+    tokens: Tensor,
+    active: Tensor,
+    reset: Tensor | None = None,
+) -> CandidateStep:
+    """Consume tokens only on active rows, optionally recycling active rows first."""
+
+    tokens, _ = _validate_candidate_tokens(state, tokens)
+    if not state.ragged_mode:
+        raise RuntimeError("step_masked requires a ragged candidate state")
+    if not isinstance(active, Tensor):
+        raise TypeError("active must be a Tensor")
+    if active.ndim == 0 and state.batch_size == 1:
+        active = active.unsqueeze(0)
+    if active.ndim != 1 or active.shape[0] != state.batch_size:
+        raise ValueError("active must have shape [batch_size]")
+    if active.dtype not in (torch.bool, torch.uint8):
+        raise TypeError("active must have dtype bool or uint8")
+    if reset is None:
+        reset = torch.zeros_like(active, dtype=torch.bool)
+    if not isinstance(reset, Tensor):
+        raise TypeError("reset must be a Tensor")
+    if reset.ndim == 0 and state.batch_size == 1:
+        reset = reset.unsqueeze(0)
+    if reset.ndim != 1 or reset.shape[0] != state.batch_size:
+        raise ValueError("reset must have shape [batch_size]")
+    if reset.dtype not in (torch.bool, torch.uint8):
+        raise TypeError("reset must have dtype bool or uint8")
+    device = tokens.device
+    cpu_tokens = tokens.detach().to(device="cpu", dtype=torch.long).contiguous()
+    cpu_active = active.detach().to(device="cpu", dtype=torch.bool).contiguous()
+    cpu_reset = reset.detach().to(device="cpu", dtype=torch.bool).contiguous()
+    effective_reset = np.logical_and(cpu_active.numpy(), cpu_reset.numpy())
+    future_positions = np.where(effective_reset, 0, state.positions)
+    if np.any(np.logical_and(cpu_active.numpy(), future_positions < 0)):
+        raise RuntimeError("candidate position must be non-negative")
+    if np.any(np.logical_and(cpu_active.numpy(), future_positions >= state.max_length)):
+        raise RuntimeError("candidate state capacity exceeded")
+    native_output = _native_candidate_call(
+        state,
+        "step_masked",
+        cpu_tokens.numpy(),
+        cpu_active.numpy(),
+        cpu_reset.numpy(),
+    )
+    if native_output is None:
+        _reset_candidate_rows_kernel(
+            effective_reset,
+            state.head,
+            state.hash_state,
+            state.suffix_link,
+            state.length,
+            state.lct_left,
+            state.lct_right,
+            state.lct_parent,
+            state.occurrence_size,
+            state.frequency,
+            state.lazy_size,
+            state.lazy_delta,
+            state.last,
+            state.size,
+            state.edge_count,
+            state.positions,
+        )
+        native_output = _step_masked_batch_kernel(
+            cpu_tokens.numpy(),
+            cpu_active.numpy(),
+            state.positions,
+            state.suffix_k,
+            state.occurrences_r,
+            state.history,
+            state.head,
+            state.edge_token,
+            state.edge_target,
+            state.edge_next,
+            state.hash_state,
+            state.hash_token,
+            state.hash_edge,
+            state.suffix_link,
+            state.length,
+            state.lct_left,
+            state.lct_right,
+            state.lct_parent,
+            state.occurrences,
+            state.occurrence_size,
+            state.frequency,
+            state.lazy_prefix,
+            state.lazy_size,
+            state.lazy_delta,
+            state.lct_stack,
+            state.last,
+            state.size,
+            state.edge_count,
+        )
+    return _candidate_step_from_arrays(state, native_output, device)
+
+
+def prefill_candidates(state: CandidateState, tokens: Tensor) -> CandidateStep:
+    """Consume a complete uniform sequence and emit candidates at every position."""
+
+    tokens, _ = _validate_candidate_tokens(state, tokens, sequence=True)
+    if state.ragged_mode:
+        raise RuntimeError("prefill is unavailable on a ragged candidate state")
+    if state.position != 0:
+        raise RuntimeError("prefill requires an empty candidate state")
+    sequence_length = tokens.shape[1]
+    if sequence_length > state.max_length:
+        raise RuntimeError("candidate state capacity exceeded")
+    device = tokens.device
+    cpu_tokens = tokens.detach().to(device="cpu", dtype=torch.long).contiguous()
+    native_output = _native_candidate_call(state, "prefill", cpu_tokens.numpy())
+    if native_output is None:
+        native_output = _prefill_candidate_kernel(
+            cpu_tokens.numpy(),
+            state.suffix_k,
+            state.occurrences_r,
+            state.history,
+            state.head,
+            state.edge_token,
+            state.edge_target,
+            state.edge_next,
+            state.hash_state,
+            state.hash_token,
+            state.hash_edge,
+            state.suffix_link,
+            state.length,
+            state.lct_left,
+            state.lct_right,
+            state.lct_parent,
+            state.occurrences,
+            state.occurrence_size,
+            state.frequency,
+            state.lazy_prefix,
+            state.lazy_size,
+            state.lazy_delta,
+            state.lct_stack,
+            state.last,
+            state.size,
+            state.edge_count,
+        )
+        state.position = sequence_length
+    state.positions.fill(state.position)
+    return _candidate_step_from_arrays(state, native_output, device)
+
+
+# Explicit aliases keep naming discoverable while preserving the original API.
+prefill_candidate_state = prefill_candidates
+reset_candidate_rows = reset_candidates_masked

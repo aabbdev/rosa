@@ -15,6 +15,12 @@ from rosa import (
 from rosa._stateful_candidates_numba import (
     CandidateState,
     CandidateStep,
+    forward_candidates_step_masked,
+    prefill_candidates,
+    reset_candidates_masked,
+)
+from rosa._stateful_candidates_numba import (
+    init_candidate_state as init_candidate_state_internal,
 )
 
 _FIELDS = (
@@ -104,6 +110,112 @@ class TestStatefulCandidates(unittest.TestCase):
             split_at=41,
         )
 
+    def test_prefill_emits_every_position_and_continues(self) -> None:
+        generator = torch.Generator().manual_seed(1804)
+        prefix = torch.randint(5, (5, 61), generator=generator)
+        continuation = torch.randint(5, (5, 17), generator=generator)
+        state = init_candidate_state(5, 78, suffix_k=6, occurrences_r=4)
+        state.native_state = False
+        actual = prefill_candidates(state, prefix)
+        expected = build_hard_candidates(prefix, suffix_k=6, occurrences_r=4)
+        for field in _FIELDS:
+            self.assertTrue(
+                torch.equal(getattr(actual, field), getattr(expected, field))
+            )
+        self.assertEqual(state.position, prefix.shape[1])
+        self.assertEqual(state.positions.tolist(), [prefix.shape[1]] * 5)
+
+        steps = [
+            forward_candidates_step(state, continuation[:, position])
+            for position in range(continuation.shape[1])
+        ]
+        full = torch.cat((prefix, continuation), dim=1)
+        expected_full = build_hard_candidates(full, suffix_k=6, occurrences_r=4)
+        for field in _FIELDS:
+            actual_tail = torch.stack([getattr(step, field) for step in steps], dim=1)
+            self.assertTrue(
+                torch.equal(
+                    actual_tail, getattr(expected_full, field)[:, prefix.shape[1] :]
+                )
+            )
+
+    def test_ragged_inactive_reset_capacity_and_recycle(self) -> None:
+        state = init_candidate_state_internal(
+            3, 5, suffix_k=4, occurrences_r=3, ragged=True
+        )
+        state.native_state = False
+        histories: list[list[int]] = [[], [], []]
+        schedule = (
+            ([1, 8, 3], [1, 1, 0], [0, 0, 0]),
+            ([2, 9, 4], [1, 0, 1], [0, 0, 0]),
+            ([1, 7, 3], [1, 1, 1], [0, 0, 0]),
+            ([2, 6, 5], [1, 1, 0], [0, 1, 0]),
+            ([1, 6, 3], [1, 1, 1], [0, 0, 1]),
+        )
+        for token_values, active_values, reset_values in schedule:
+            tokens = torch.tensor(token_values)
+            active = torch.tensor(active_values, dtype=torch.bool)
+            reset = torch.tensor(reset_values, dtype=torch.bool)
+            actual = forward_candidates_step_masked(state, tokens, active, reset)
+            for batch_index in range(3):
+                if not active_values[batch_index]:
+                    self.assertFalse(bool(actual.mask[batch_index].any()))
+                    continue
+                if reset_values[batch_index]:
+                    histories[batch_index].clear()
+                histories[batch_index].append(token_values[batch_index])
+                oracle = build_hard_candidates(
+                    torch.tensor([histories[batch_index]]),
+                    suffix_k=4,
+                    occurrences_r=3,
+                )
+                for field in _FIELDS:
+                    self.assertTrue(
+                        torch.equal(
+                            getattr(actual, field)[batch_index],
+                            getattr(oracle, field)[0, -1],
+                        ),
+                        field,
+                    )
+        self.assertEqual(state.positions.tolist(), [5, 2, 1])
+        reset_candidates_masked(state, torch.tensor([True, False, True]))
+        self.assertEqual(state.positions.tolist(), [0, 2, 0])
+        recycled = forward_candidates_step_masked(
+            state,
+            torch.tensor([4, 0, 4]),
+            torch.tensor([True, False, True]),
+        )
+        self.assertFalse(bool(recycled.mask.any()))
+
+        full = init_candidate_state_internal(1, 1, ragged=True)
+        full.native_state = False
+        forward_candidates_step_masked(full, torch.tensor([1]), torch.tensor([True]))
+        with self.assertRaisesRegex(RuntimeError, "capacity"):
+            forward_candidates_step_masked(
+                full, torch.tensor([2]), torch.tensor([True])
+            )
+        # Reset and consume in one operation must be allowed at full capacity.
+        forward_candidates_step_masked(
+            full,
+            torch.tensor([2]),
+            torch.tensor([True]),
+            torch.tensor([True]),
+        )
+
+    def test_uniform_and_ragged_modes_cannot_mix(self) -> None:
+        uniform = init_candidate_state(1, 2)
+        ragged = init_candidate_state_internal(1, 2, ragged=True)
+        with self.assertRaisesRegex(RuntimeError, "ragged"):
+            forward_candidates_step_masked(
+                uniform, torch.tensor([1]), torch.tensor([True])
+            )
+        with self.assertRaisesRegex(RuntimeError, "ragged"):
+            forward_candidates_step(ragged, torch.tensor([1]))
+        with self.assertRaisesRegex(RuntimeError, "ragged"):
+            prefill_candidates(ragged, torch.tensor([[1]]))
+        with self.assertRaisesRegex(RuntimeError, "ragged"):
+            reset_candidates_masked(uniform, torch.tensor([True]))
+
     def test_scalar_batch_and_validation(self) -> None:
         state = init_candidate_state(1, 2, suffix_k=2, occurrences_r=2)
         first = forward_candidates_step(state, torch.tensor(7))
@@ -134,6 +246,85 @@ class TestStatefulCandidates(unittest.TestCase):
             forward_candidates_step(object(), torch.tensor([1]))  # type: ignore[arg-type]
         with self.assertRaisesRegex(TypeError, "Tensor"):
             forward_candidates_step(state, object())  # type: ignore[arg-type]
+
+        ragged = init_candidate_state_internal(1, 3, ragged=True)
+        ragged.native_state = False
+        with self.assertRaisesRegex(TypeError, "CandidateState"):
+            reset_candidates_masked(object(), torch.tensor([True]))  # type: ignore[arg-type]
+        with self.assertRaisesRegex(TypeError, "Tensor"):
+            reset_candidates_masked(ragged, object())  # type: ignore[arg-type]
+        reset_candidates_masked(ragged, torch.tensor(True))
+        with self.assertRaisesRegex(ValueError, "shape"):
+            reset_candidates_masked(ragged, torch.tensor([True, False]))
+        with self.assertRaisesRegex(TypeError, "bool or uint8"):
+            reset_candidates_masked(ragged, torch.tensor([1]))
+
+        with self.assertRaisesRegex(TypeError, "active"):
+            forward_candidates_step_masked(
+                ragged,
+                torch.tensor([1]),
+                object(),  # type: ignore[arg-type]
+            )
+        forward_candidates_step_masked(ragged, torch.tensor([1]), torch.tensor(True))
+        with self.assertRaisesRegex(ValueError, "active"):
+            forward_candidates_step_masked(
+                ragged, torch.tensor([1]), torch.tensor([True, False])
+            )
+        with self.assertRaisesRegex(TypeError, "active"):
+            forward_candidates_step_masked(ragged, torch.tensor([1]), torch.tensor([1]))
+        with self.assertRaisesRegex(TypeError, "reset"):
+            forward_candidates_step_masked(
+                ragged,
+                torch.tensor([1]),
+                torch.tensor([True]),
+                object(),  # type: ignore[arg-type]
+            )
+        forward_candidates_step_masked(
+            ragged,
+            torch.tensor([1]),
+            torch.tensor([True]),
+            torch.tensor(True),
+        )
+        with self.assertRaisesRegex(ValueError, "reset"):
+            forward_candidates_step_masked(
+                ragged,
+                torch.tensor([1]),
+                torch.tensor([True]),
+                torch.tensor([True, False]),
+            )
+        with self.assertRaisesRegex(TypeError, "reset"):
+            forward_candidates_step_masked(
+                ragged,
+                torch.tensor([1]),
+                torch.tensor([True]),
+                torch.tensor([1]),
+            )
+
+        prefill_state = init_candidate_state_internal(1, 1)
+        prefill_state.native_state = False
+        with self.assertRaisesRegex(ValueError, "shape"):
+            prefill_candidates(prefill_state, torch.tensor([1]))
+        with self.assertRaisesRegex(TypeError, "integer"):
+            prefill_candidates(prefill_state, torch.tensor([[1.0]]))
+        prefill_candidates(prefill_state, torch.tensor([[1]]))
+        with self.assertRaisesRegex(RuntimeError, "empty"):
+            prefill_candidates(prefill_state, torch.tensor([[1]]))
+        too_long = init_candidate_state_internal(1, 1)
+        with self.assertRaisesRegex(RuntimeError, "capacity"):
+            prefill_candidates(too_long, torch.tensor([[1, 2]]))
+
+        negative = init_candidate_state_internal(1, 2, ragged=True)
+        negative.native_state = False
+        negative.positions[0] = -1
+        with self.assertRaisesRegex(RuntimeError, "non-negative"):
+            forward_candidates_step_masked(
+                negative, torch.tensor([1]), torch.tensor([True])
+            )
+
+        old_capability = init_candidate_state_internal(1, 2)
+        old_capability.native_state = object()
+        prefill_candidates(old_capability, torch.tensor([[0, 1]]))
+        self.assertIs(old_capability.native_state, False)
 
     def test_public_wrapper_reports_missing_numba(self) -> None:
         with patch.dict(sys.modules):

@@ -11,7 +11,10 @@ import torch
 from rosa._stateful_candidates_numba import (
     CandidateStep,
     forward_candidates_step,
+    forward_candidates_step_masked,
     init_candidate_state,
+    prefill_candidates,
+    reset_candidates_masked,
 )
 
 
@@ -83,6 +86,87 @@ def main() -> None:
         column = np.ascontiguousarray(random_tokens[:, position].numpy())
         assert_step_equal(continuation.step(column), expected)
 
+    # One native prefill call emits every historical field and leaves a
+    # continuation-compatible state, including clone-heavy/random inputs.
+    prefix_length = 137
+    prefill_oracle = init_candidate_state(7, 193, suffix_k=7, occurrences_r=5)
+    prefill_oracle.native_state = False
+    expected_prefill = prefill_candidates(
+        prefill_oracle, random_tokens[:, :prefix_length]
+    )
+    prefill_state = init_candidate_state(7, 193, suffix_k=7, occurrences_r=5)
+    native_prefill = rosa_native_step.NativeCandidateState(prefill_state)
+    actual_prefill = native_prefill.prefill(
+        np.ascontiguousarray(random_tokens[:, :prefix_length].numpy())
+    )
+    expected_arrays = (
+        expected_prefill.source_index.numpy(),
+        expected_prefill.match_length.numpy(),
+        expected_prefill.state_id.numpy(),
+        expected_prefill.frequency.numpy(),
+        expected_prefill.mask.sum(dim=2).numpy().astype(np.int32),
+    )
+    for actual, expected in zip(actual_prefill, expected_arrays, strict=True):
+        assert np.array_equal(actual, expected)
+    assert native_prefill.position == prefill_state.position == prefix_length
+    assert np.array_equal(native_prefill.positions, np.full(7, prefix_length))
+    for position in range(prefix_length, random_tokens.shape[1]):
+        expected = forward_candidates_step(prefill_oracle, random_tokens[:, position])
+        assert_step_equal(
+            native_prefill.step(
+                np.ascontiguousarray(random_tokens[:, position].numpy())
+            ),
+            expected,
+        )
+
+    # Ragged active/reset/recycle follows independent per-row positions.  The
+    # Numba fallback is the exact oracle and inactive rows emit empty outputs.
+    ragged_oracle = init_candidate_state(
+        5, 17, suffix_k=5, occurrences_r=3, ragged=True
+    )
+    ragged_oracle.native_state = False
+    ragged_state = init_candidate_state(5, 17, suffix_k=5, occurrences_r=3, ragged=True)
+    native_ragged = rosa_native_step.NativeCandidateState(ragged_state)
+    ragged_generator = np.random.default_rng(1804)
+    for iteration in range(73):
+        token_values = ragged_generator.integers(-2, 7, size=5, dtype=np.int64)
+        active = ragged_generator.random(5) < 0.72
+        reset = np.logical_and(active, ragged_generator.random(5) < 0.13)
+        full = np.logical_and(active, ragged_oracle.positions >= 17)
+        reset = np.logical_or(reset, full)
+        expected = forward_candidates_step_masked(
+            ragged_oracle,
+            torch.from_numpy(token_values),
+            torch.from_numpy(active),
+            torch.from_numpy(reset),
+        )
+        actual = native_ragged.step_masked(token_values, active, reset)
+        assert_step_equal(actual, expected)
+        assert np.array_equal(native_ragged.positions, ragged_oracle.positions)
+    reset_rows = np.array([True, False, True, False, True])
+    reset_candidates_masked(ragged_oracle, torch.from_numpy(reset_rows))
+    native_ragged.reset_masked(reset_rows)
+    assert np.array_equal(native_ragged.positions, ragged_oracle.positions)
+    assert np.array_equal(ragged_state.size, ragged_oracle.size)
+
+    for action in (
+        lambda: native_ragged.step(np.zeros(5, dtype=np.int64)),
+        lambda: native_ragged.prefill(np.zeros((5, 1), dtype=np.int64)),
+        lambda: rosa_native_step.NativeCandidateState(
+            init_candidate_state(1, 2)
+        ).step_masked(
+            np.zeros(1, dtype=np.int64),
+            np.ones(1, dtype=np.bool_),
+            np.zeros(1, dtype=np.bool_),
+        ),
+    ):
+        try:
+            action()
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("uniform/ragged candidate modes were mixed")
+
     state = init_candidate_state(2, 4, suffix_k=3, occurrences_r=2)
     state_ref = weakref.ref(state)
     native = rosa_native_step.NativeCandidateState(state)
@@ -90,6 +174,35 @@ def main() -> None:
     gc.collect()
     assert state_ref() is not None
     native.step(np.array([1, 2], dtype=np.int64))
+
+    # ABI 1 compatibility: pre-positions uniform states remain accepted.
+    legacy = init_candidate_state(1, 2)
+    del legacy.positions
+    legacy_native = rosa_native_step.NativeCandidateState(legacy)
+    legacy_native.step(np.array([1], dtype=np.int64))
+
+    invalid_position = init_candidate_state(1, 2, ragged=True)
+    invalid_position.positions[0] = -1
+    try:
+        rosa_native_step.NativeCandidateState(invalid_position)
+    except ValueError as error:
+        assert "positions" in str(error)
+    else:
+        raise AssertionError("negative candidate position was accepted")
+
+    runtime_position = init_candidate_state(1, 2, ragged=True)
+    runtime_native = rosa_native_step.NativeCandidateState(runtime_position)
+    runtime_position.positions[0] = -1
+    try:
+        runtime_native.step_masked(
+            np.array([1], dtype=np.int64),
+            np.array([True]),
+            np.array([False]),
+        )
+    except RuntimeError as error:
+        assert "non-negative" in str(error)
+    else:
+        raise AssertionError("mutated negative candidate position was consumed")
 
     for invalid in (
         np.zeros(2, dtype=np.int32),

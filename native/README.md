@@ -23,10 +23,14 @@ suffixes, R occurrences les plus récentes, fréquences non bornées et tags LCT
 capacité peut être détectée via la présence de `NativeCandidateState` et
 `candidate_abi_version == 1`.
 
-Cette première ABI riche expose `step`, `reset` global et `position`. Elle
-n'expose pas encore de préremplissage riche ni de reset/continuation masqué par
-ligne; ces opérations nécessitent un contrat de positions par ligne distinct
-de `CandidateState.position`.
+L'ABI riche conserve `step`, `reset` global et `position`, et détecte par
+capacité les extensions `prefill`, `step_masked`, `reset_masked` et
+`positions`. `prefill` émet les cinq tableaux natifs à chaque position dans un
+seul appel C++ et laisse l'état continuable. Le mode ragged possède une position
+par ligne; les chemins uniformes et ragged sont volontairement incompatibles
+afin qu'une seule autorité de position existe à tout instant. Le wrapper Python
+retombe exactement sur Numba lorsqu'un ancien wheel ABI 1 ne fournit pas ces
+méthodes optionnelles.
 
 ## Installation et utilisation
 
