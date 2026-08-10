@@ -1089,6 +1089,28 @@ def _native_step(  # pragma: no cover - optional native companion
     return state.native_state.step(cpu_tokens.numpy())
 
 
+def _native_prefill(  # pragma: no cover - optional native companion
+    state: _StatefulInferenceState,
+    cpu_tokens: Tensor,
+) -> np.ndarray | None:
+    if state.native_state is False:
+        return None
+    if state.native_state is None:
+        try:
+            from rosa_native_step import (  # type: ignore[reportMissingImports]
+                NativeState,
+            )
+        except ModuleNotFoundError:
+            state.native_state = False
+            return None
+        state.native_state = NativeState(state)
+    native_prefill = getattr(state.native_state, "prefill", None)
+    if native_prefill is None:
+        state.native_state = False
+        return None
+    return native_prefill(cpu_tokens.numpy())
+
+
 def _forward_step(state: _StatefulInferenceState, tokens: Tensor) -> Tensor:
     """Consume one token per batch row and return exact top-1 predictions."""
 
@@ -1144,6 +1166,9 @@ def _prefill(state: _StatefulInferenceState, tokens: Tensor) -> Tensor:
     if tokens.shape[1] == 0:
         return torch.empty(tokens.shape, dtype=torch.long, device=device)
     cpu_tokens = tokens.detach().to(device="cpu", dtype=torch.long).contiguous()
+    native_output = _native_prefill(state, cpu_tokens)
+    if native_output is not None:  # pragma: no cover - optional native companion
+        return torch.from_numpy(native_output).to(device)
     output_array = _bulk_prefill_kernel(
         cpu_tokens.numpy(),
         state.history,
