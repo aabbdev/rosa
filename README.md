@@ -256,3 +256,15 @@ The current suffix-automaton control path is written in Python and stores bounde
 - Disabling the learned residual restores exact ROSA ranking among suffix candidates.
 - Disabling virtual candidates does not affect the exact suffix branch or NULL candidate.
 - No dense trainable state-to-token-to-state transition tensor is used.
+
+## Acknowledgements
+
+ROSA gratefully acknowledges [Bo Peng (BlinkDL)](https://github.com/BlinkDL),
+creator of [RWKV](https://www.rwkv.com/), for advancing efficient long-context
+sequence modeling through architectures that combine RNN-style linear-time
+inference with Transformer-style parallel training. The community can be found
+on the official
+[RWKV Discord server](https://discord.gg/bDSBUMeFpc).
+
+ROSA is an independent project and is not affiliated with or endorsed by Bo
+Peng or the RWKV project.
