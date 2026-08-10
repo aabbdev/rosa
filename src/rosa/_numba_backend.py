@@ -177,6 +177,14 @@ def _predict_batch(tokens: np.ndarray) -> np.ndarray:
     return output
 
 
+@njit(cache=True, nogil=True)
+def _predict_serial_batch(tokens: np.ndarray) -> np.ndarray:
+    output = np.empty(tokens.shape, dtype=np.int64)
+    for batch_index in range(tokens.shape[0]):
+        output[batch_index] = _predict_row(tokens[batch_index])
+    return output
+
+
 def predict_exact(tokens: Tensor) -> Tensor:
     """Return exact ROSA predictions using an optional CPU Numba backend."""
 
@@ -187,5 +195,12 @@ def predict_exact(tokens: Tensor) -> Tensor:
         raise ValueError("tokens must have shape [N] or [B, N]")
     device = tokens.device
     cpu_tokens = tokens.detach().to(device="cpu", dtype=torch.long).contiguous()
-    output = torch.from_numpy(_predict_batch(cpu_tokens.numpy())).to(device)
+    cpu_array = cpu_tokens.numpy()
+    if cpu_array.shape[0] == 1:
+        output_array = _predict_row(cpu_array[0]).reshape(1, -1)
+    elif cpu_array.size <= 4096:
+        output_array = _predict_serial_batch(cpu_array)
+    else:
+        output_array = _predict_batch(cpu_array)
+    output = torch.from_numpy(output_array).to(device)
     return output[0] if squeeze else output
