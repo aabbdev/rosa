@@ -256,7 +256,18 @@ uv build
 
 The neural retrieval side operates on a bounded candidate set rather than all prior positions. For fixed `suffix_k`, `occurrences_r`, verification window, and virtual-pool size, its work per token is bounded independently of context length.
 
-The current suffix-automaton control path is written in Python and stores bounded occurrence histories on suffix-link chains. It is designed for correctness, experimentation, and straightforward integration. For high-throughput training at very long context lengths, the discrete automaton and candidate-building path is the natural component to move to a C++/CUDA/Triton kernel while preserving the tensor-facing module interface and differentiable retrieval path.
+The exact suffix-automaton control path intentionally runs on CPU, following
+the RWKV-8 ROSA proposal. Hard token IDs are copied to CPU, the dynamic
+suffix-automaton reads and writes happen there, and the bounded candidate
+tensors are returned to the original PyTorch device. Accelerator backends such
+as TileLang or Triton should optimize only the differentiable tensor path around
+the automaton.
+
+The current implementation performs this CPU work synchronously and rebuilds
+the automaton for each full-sequence call. Production autoregressive inference
+can improve throughput with a stateful CPU worker whose automaton updates are
+pipelined alongside GPU layers, while preserving the same exact candidate
+semantics and PyTorch fallback.
 
 ## Design guarantees
 

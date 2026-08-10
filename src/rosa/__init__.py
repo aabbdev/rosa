@@ -664,6 +664,9 @@ class ROSA(nn.Module):
             raise ValueError("z_b must have the same shape as z_a")
 
         (soft1, soft2), (st1, st2), hard_tokens = self.encode(z_a, code_logits)
+        # Keep the exact, non-differentiable automaton on CPU as proposed for
+        # RWKV-8 ROSA. Accelerator backends may optimize the tensor path around
+        # it, but must not silently replace this exact discrete control path.
         hard = build_hard_candidates(
             hard_tokens,
             suffix_k=self.suffix_k,
