@@ -8,18 +8,79 @@ from numba import njit, prange
 from torch import Tensor
 
 
+@njit(cache=True, nogil=True, inline="always")
+def _find_transition(
+    head: np.ndarray,
+    edge_token: np.ndarray,
+    edge_target: np.ndarray,
+    edge_next: np.ndarray,
+    state: int,
+    token: int,
+) -> int:
+    edge = head[state]
+    while edge != -1:
+        if edge_token[edge] == token:
+            return edge_target[edge]
+        edge = edge_next[edge]
+    return -1
+
+
+@njit(cache=True, nogil=True, inline="always")
+def _add_transition(
+    head: np.ndarray,
+    edge_token: np.ndarray,
+    edge_target: np.ndarray,
+    edge_next: np.ndarray,
+    edge_count: int,
+    state: int,
+    token: int,
+    target: int,
+) -> int:
+    if edge_count >= edge_token.shape[0]:
+        raise RuntimeError("suffix automaton transition capacity exceeded")
+    edge_token[edge_count] = token
+    edge_target[edge_count] = target
+    edge_next[edge_count] = head[state]
+    head[state] = edge_count
+    return edge_count + 1
+
+
+@njit(cache=True, nogil=True, inline="always")
+def _replace_transition(
+    head: np.ndarray,
+    edge_token: np.ndarray,
+    edge_target: np.ndarray,
+    edge_next: np.ndarray,
+    state: int,
+    token: int,
+    target: int,
+) -> None:
+    edge = head[state]
+    while edge != -1:
+        if edge_token[edge] == token:
+            edge_target[edge] = target
+            return
+        edge = edge_next[edge]
+    raise RuntimeError("suffix automaton transition not found")
+
+
 @njit(cache=True, nogil=True)
 def _predict_row(tokens: np.ndarray) -> np.ndarray:
     n = tokens.shape[0]
     vocabulary_size = int(tokens.max()) + 1
     max_states = 2 * n + 1
-    transitions = np.full((max_states, vocabulary_size), -1, dtype=np.int32)
+    max_edges = 4 * n + vocabulary_size + 1
+    head = np.full(max_states, -1, dtype=np.int32)
+    edge_token = np.empty(max_edges, dtype=np.int32)
+    edge_target = np.empty(max_edges, dtype=np.int32)
+    edge_next = np.empty(max_edges, dtype=np.int32)
     suffix_link = np.full(max_states, -1, dtype=np.int32)
     length = np.zeros(max_states, dtype=np.int32)
     latest_end = np.full(max_states, -1, dtype=np.int32)
     predicted = np.full(n, -1, dtype=np.int64)
     last = 0
     size = 1
+    edge_count = 0
 
     for i in range(n):
         token = int(tokens[i])
@@ -28,25 +89,66 @@ def _predict_row(tokens: np.ndarray) -> np.ndarray:
         length[current] = length[last] + 1
         state = last
 
-        while state != -1 and transitions[state, token] == -1:
-            transitions[state, token] = current
+        while (
+            state != -1
+            and _find_transition(head, edge_token, edge_target, edge_next, state, token)
+            == -1
+        ):
+            edge_count = _add_transition(
+                head,
+                edge_token,
+                edge_target,
+                edge_next,
+                edge_count,
+                state,
+                token,
+                current,
+            )
             state = suffix_link[state]
 
         if state == -1:
             suffix_link[current] = 0
         else:
-            target = transitions[state, token]
+            target = _find_transition(
+                head, edge_token, edge_target, edge_next, state, token
+            )
             if length[state] + 1 == length[target]:
                 suffix_link[current] = target
             else:
                 clone = size
                 size += 1
-                transitions[clone, :] = transitions[target, :]
                 length[clone] = length[state] + 1
                 suffix_link[clone] = suffix_link[target]
                 latest_end[clone] = latest_end[target]
-                while state != -1 and transitions[state, token] == target:
-                    transitions[state, token] = clone
+                edge = head[target]
+                while edge != -1:
+                    edge_count = _add_transition(
+                        head,
+                        edge_token,
+                        edge_target,
+                        edge_next,
+                        edge_count,
+                        clone,
+                        edge_token[edge],
+                        edge_target[edge],
+                    )
+                    edge = edge_next[edge]
+                while (
+                    state != -1
+                    and _find_transition(
+                        head, edge_token, edge_target, edge_next, state, token
+                    )
+                    == target
+                ):
+                    _replace_transition(
+                        head,
+                        edge_token,
+                        edge_target,
+                        edge_next,
+                        state,
+                        token,
+                        clone,
+                    )
                     state = suffix_link[state]
                 suffix_link[target] = clone
                 suffix_link[current] = clone
