@@ -34,7 +34,7 @@ jobs:
           enable-cache: true
 
       - name: Install locked dependencies
-        run: uv sync --locked --all-groups
+        run: uv sync --locked --all-groups --extra numba
 
       - name: Lint
         run: uv run ruff check .

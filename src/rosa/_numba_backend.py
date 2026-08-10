@@ -9,7 +9,7 @@ from torch import Tensor
 
 
 @njit(cache=True, nogil=True, inline="always")
-def _find_transition(
+def _find_transition(  # pragma: no cover - executed as compiled Numba code
     head: np.ndarray,
     edge_token: np.ndarray,
     edge_target: np.ndarray,
@@ -20,13 +20,13 @@ def _find_transition(
     edge = head[state]
     while edge != -1:
         if edge_token[edge] == token:
-            return edge_target[edge]
+            return int(edge_target[edge])
         edge = edge_next[edge]
     return -1
 
 
 @njit(cache=True, nogil=True, inline="always")
-def _add_transition(
+def _add_transition(  # pragma: no cover - executed as compiled Numba code
     head: np.ndarray,
     edge_token: np.ndarray,
     edge_target: np.ndarray,
@@ -46,7 +46,7 @@ def _add_transition(
 
 
 @njit(cache=True, nogil=True, inline="always")
-def _replace_transition(
+def _replace_transition(  # pragma: no cover - executed as compiled Numba code
     head: np.ndarray,
     edge_token: np.ndarray,
     edge_target: np.ndarray,
@@ -65,13 +65,14 @@ def _replace_transition(
 
 
 @njit(cache=True, nogil=True)
-def _predict_row(tokens: np.ndarray) -> np.ndarray:
+def _predict_row(  # pragma: no cover - executed as compiled Numba code
+    tokens: np.ndarray,
+) -> np.ndarray:
     n = tokens.shape[0]
-    vocabulary_size = int(tokens.max()) + 1
     max_states = 2 * n + 1
-    max_edges = 4 * n + vocabulary_size + 1
+    max_edges = 4 * n + 1
     head = np.full(max_states, -1, dtype=np.int32)
-    edge_token = np.empty(max_edges, dtype=np.int32)
+    edge_token = np.empty(max_edges, dtype=np.int64)
     edge_target = np.empty(max_edges, dtype=np.int32)
     edge_next = np.empty(max_edges, dtype=np.int32)
     suffix_link = np.full(max_states, -1, dtype=np.int32)
@@ -170,7 +171,9 @@ def _predict_row(tokens: np.ndarray) -> np.ndarray:
 
 
 @njit(cache=True, nogil=True, parallel=True)
-def _predict_batch(tokens: np.ndarray) -> np.ndarray:
+def _predict_batch(  # pragma: no cover - executed as compiled Numba code
+    tokens: np.ndarray,
+) -> np.ndarray:
     output = np.empty(tokens.shape, dtype=np.int64)
     for batch_index in prange(tokens.shape[0]):
         output[batch_index] = _predict_row(tokens[batch_index])
@@ -178,7 +181,9 @@ def _predict_batch(tokens: np.ndarray) -> np.ndarray:
 
 
 @njit(cache=True, nogil=True)
-def _predict_serial_batch(tokens: np.ndarray) -> np.ndarray:
+def _predict_serial_batch(  # pragma: no cover - executed as compiled Numba code
+    tokens: np.ndarray,
+) -> np.ndarray:
     output = np.empty(tokens.shape, dtype=np.int64)
     for batch_index in range(tokens.shape[0]):
         output[batch_index] = _predict_row(tokens[batch_index])
@@ -194,6 +199,9 @@ def predict_exact(tokens: Tensor) -> Tensor:
     if tokens.ndim != 2:
         raise ValueError("tokens must have shape [N] or [B, N]")
     device = tokens.device
+    if tokens.shape[1] == 0:
+        output = torch.empty(tokens.shape, dtype=torch.long, device=device)
+        return output[0] if squeeze else output
     cpu_tokens = tokens.detach().to(device="cpu", dtype=torch.long).contiguous()
     cpu_array = cpu_tokens.numpy()
     if cpu_array.shape[0] == 1:
