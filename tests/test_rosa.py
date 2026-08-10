@@ -176,6 +176,16 @@ class TestROSAConfiguration(unittest.TestCase):
                 dict(d_model=4, virtual_candidates=4, virtual_pool_size=3),
                 "virtual_pool_size",
             ),
+            (dict(d_model=4, dense_recent_candidates=-1), "dense_recent"),
+            (dict(d_model=4, sparse_old_candidates=-1), "sparse_old"),
+            (
+                dict(
+                    d_model=4,
+                    sparse_old_candidates=2,
+                    sparse_old_pool_size=1,
+                ),
+                "sparse_old_pool_size",
+            ),
             (dict(d_model=4, selector_dim=0), "selector_dim"),
             (dict(d_model=4, token_temperature=0), "temperatures"),
             (dict(d_model=4, retrieval_temperature=0), "temperatures"),
@@ -192,6 +202,8 @@ class TestROSAConfiguration(unittest.TestCase):
                 self.assertRaisesRegex(ValueError, pattern),
             ):
                 ROSA(**kwargs)
+        with self.assertRaisesRegex(TypeError, "soft_candidates_forward"):
+            ROSA(d_model=4, soft_candidates_forward=1)  # type: ignore[arg-type]
 
     def test_setters_property_and_encode_validation(self) -> None:
         model = ROSA(
@@ -429,6 +441,161 @@ class TestROSASemantics(unittest.TestCase):
         self.assertIsNotNone(logits[1].grad)
         self.assertGreater(
             float(logits[0].grad.abs().sum() + logits[1].grad.abs().sum()), 0.0
+        )
+
+    def test_hybrid_union_quotas_causality_dedup_and_constant_budget(self) -> None:
+        model = ROSA(
+            d_model=8,
+            codebook_sizes=(4, 4),
+            suffix_k=2,
+            occurrences_r=2,
+            soft_verify_window=3,
+            virtual_candidates=1,
+            virtual_pool_size=2,
+            dense_recent_candidates=3,
+            sparse_old_candidates=2,
+            sparse_old_pool_size=4,
+            selector_dim=8,
+            virtual_scale=0.0,
+        )
+        for n in (7, 12):
+            tokens = torch.arange(n, dtype=torch.long).unsqueeze(0)
+            logits = factor_logits_from_tokens(tokens, (4, 4))
+            out = model(torch.randn(1, n, 8), code_logits=logits)
+            # K*R hard, one legacy virtual, D dense, S sparse, NULL.
+            self.assertEqual(out.candidate_source_index.shape[-1], 4 + 1 + 3 + 2 + 1)
+            dense = slice(5, 8)
+            sparse = slice(8, 10)
+            for i in range(n):
+                dense_valid = out.candidate_source_index[0, i, dense][
+                    out.candidate_mask[0, i, dense]
+                ]
+                sparse_valid = out.candidate_source_index[0, i, sparse][
+                    out.candidate_mask[0, i, sparse]
+                ]
+                self.assertEqual(dense_valid.numel(), min(3, i))
+                self.assertEqual(sparse_valid.numel(), min(2, max(0, i - 3)))
+                if dense_valid.numel():
+                    self.assertTrue(torch.all(dense_valid < i))
+                    self.assertEqual(
+                        dense_valid.tolist(), list(range(i - 1, max(-1, i - 4), -1))
+                    )
+                if sparse_valid.numel():
+                    self.assertTrue(torch.all(sparse_valid < i - 3))
+                valid_source = out.candidate_source_index[0, i][
+                    out.candidate_mask[0, i] & (out.candidate_source_index[0, i] >= 0)
+                ]
+                self.assertEqual(len(valid_source), len(set(valid_source.tolist())))
+
+        # All sparse scores tie for unique symbols: stable secondary ordering
+        # chooses the newest anchors, [6, 4], from [0, 2, 4, 6].
+        self.assertEqual(out.candidate_source_index[0, 10, 8:10].tolist(), [6, 4])
+
+        one_anchor = self.make_model(
+            dense_recent_candidates=1,
+            sparse_old_candidates=1,
+            sparse_old_pool_size=1,
+        )
+        one_anchor(
+            torch.randn(1, 4, 8),
+            code_logits=factor_logits_from_tokens(
+                torch.arange(4, dtype=torch.long).unsqueeze(0), (2, 3)
+            ),
+        )
+
+    def test_soft_only_union_preserves_hard_forward_and_opt_in_can_win(self) -> None:
+        torch.manual_seed(2026)
+        tokens = torch.tensor([[0, 1, 0, 2, 3, 1, 4, 5]], dtype=torch.long)
+        logits = factor_logits_from_tokens(tokens, (2, 3), hi=4.0, lo=-4.0)
+        z_a = torch.randn(1, tokens.shape[1], 8)
+        z_b = torch.randn_like(z_a)
+        baseline = self.make_model(virtual_scale=0.0)
+        union = self.make_model(
+            virtual_scale=0.0,
+            dense_recent_candidates=2,
+            sparse_old_candidates=2,
+            sparse_old_pool_size=4,
+            soft_candidates_forward=False,
+        )
+        union.load_state_dict(baseline.state_dict())
+        expected = baseline(z_a, z_b=z_b, code_logits=logits)
+        actual = union(z_a, z_b=z_b, code_logits=logits)
+        for name in (
+            "updated",
+            "retrieved",
+            "chosen_source_index",
+            "chosen_token",
+            "chosen_match_length",
+            "hard_rosa_source_index",
+            "hard_rosa_predicted_tokens",
+        ):
+            self.assertTrue(
+                torch.equal(getattr(actual, name), getattr(expected, name)), name
+            )
+
+        opt_in = self.make_model(
+            learned_residual_scale=1.0,
+            virtual_scale=0.0,
+            dense_recent_candidates=1,
+            sparse_old_candidates=0,
+            soft_candidates_forward=True,
+        )
+        zero_learned_scorer(opt_in)
+        with torch.no_grad():
+            opt_in.kind_bias[VIRTUAL_KIND] = 30.0
+            opt_in.kind_bias[NULL_KIND] = -30.0
+        unique = torch.tensor([[0, 1, 2, 3, 4, 5]], dtype=torch.long)
+        unique_logits = factor_logits_from_tokens(unique, (2, 3))
+        opted = opt_in(torch.zeros(1, 6, 8), code_logits=unique_logits)
+        self.assertTrue(opted.chosen_is_virtual[0, 1:].all())
+        self.assertEqual(opted.chosen_source_index[0, 1:].tolist(), [0, 1, 2, 3, 4])
+
+    def test_recent_and_old_almost_matches_receive_targeted_gradient(self) -> None:
+        torch.manual_seed(2026)
+        tokens = torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7]], dtype=torch.long)
+        # A small margin keeps hard argmaxes distinct while exposing useful
+        # overlap to the soft backward path.
+        logits = factor_logits_from_tokens(
+            tokens, (2, 4), hi=0.1, lo=0.0, requires_grad=True
+        )
+        hard = build_hard_candidates(tokens, suffix_k=1, occurrences_r=1)
+        self.assertFalse(hard.mask[0, 7, 0])
+        model = ROSA(
+            d_model=8,
+            codebook_sizes=(2, 4),
+            suffix_k=1,
+            occurrences_r=1,
+            soft_verify_window=3,
+            virtual_candidates=1,
+            virtual_pool_size=2,
+            dense_recent_candidates=2,
+            sparse_old_candidates=1,
+            sparse_old_pool_size=4,
+            selector_dim=8,
+            learned_residual_scale=1.0,
+            virtual_scale=0.0,
+            soft_candidates_forward=False,
+        )
+        out = model(torch.randn(1, 8, 8), code_logits=logits)
+        # Layout: hard[1], legacy[1], dense[2], sparse[1], NULL.
+        recent_position, recent_slot = 7, 2
+        old_position, old_slot = 7, 4
+        self.assertEqual(
+            int(out.candidate_source_index[0, recent_position, recent_slot]), 6
+        )
+        self.assertEqual(int(out.candidate_source_index[0, old_position, old_slot]), 4)
+        self.assertLess(4, old_position - model.dense_recent_candidates)
+        recent_loss = -torch.log(out.soft_weights[0, recent_position, recent_slot])
+        old_loss = -torch.log(out.soft_weights[0, old_position, old_slot])
+        recent_gradient = torch.autograd.grad(recent_loss, logits, retain_graph=True)
+        old_gradient = torch.autograd.grad(old_loss, logits)
+        self.assertGreater(
+            float(sum(gradient[0, 4:8].abs().sum() for gradient in recent_gradient)),
+            1e-8,
+        )
+        self.assertGreater(
+            float(sum(gradient[0, 1:8].abs().sum() for gradient in old_gradient)),
+            1e-8,
         )
 
     def test_combine_losses_validation(self) -> None:

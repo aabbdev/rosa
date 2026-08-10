@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import sys
 import unittest
 from itertools import product
+from unittest.mock import patch
 
 import torch
 
-from rosa import build_hard_candidates
+from rosa import (
+    build_hard_candidates,
+    forward_candidates_step,
+    init_candidate_state,
+)
 from rosa._stateful_candidates_numba import (
     CandidateState,
     CandidateStep,
-    forward_candidates_step,
-    init_candidate_state,
 )
 
 _FIELDS = (
@@ -127,6 +131,17 @@ class TestStatefulCandidates(unittest.TestCase):
             forward_candidates_step(shape_state, torch.tensor([1.0, 2.0]))
         with self.assertRaisesRegex(TypeError, "CandidateState"):
             forward_candidates_step(object(), torch.tensor([1]))  # type: ignore[arg-type]
+        with self.assertRaisesRegex(TypeError, "Tensor"):
+            forward_candidates_step(state, object())  # type: ignore[arg-type]
+
+    def test_public_wrapper_reports_missing_numba(self) -> None:
+        with patch.dict(sys.modules):
+            sys.modules.pop("rosa._stateful_candidates_numba", None)
+            sys.modules["numba"] = None
+            with self.assertRaisesRegex(RuntimeError, "numba"):
+                init_candidate_state(1, 1)
+            with self.assertRaisesRegex(RuntimeError, "numba"):
+                forward_candidates_step(object(), torch.tensor([1]))
 
 
 if __name__ == "__main__":

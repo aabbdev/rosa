@@ -31,7 +31,9 @@ __all__ = [
     "ROSAOutput",
     "build_hard_candidates",
     "build_virtual_pool_indices",
+    "forward_candidates_step",
     "forward_step",
+    "init_candidate_state",
     "init_inference_state",
     "prefill",
     "reference_rosa",
@@ -495,6 +497,10 @@ class ROSA(nn.Module):
         soft_verify_window: int = 32,
         virtual_candidates: int = 4,
         virtual_pool_size: int = 64,
+        dense_recent_candidates: int = 0,
+        sparse_old_candidates: int = 0,
+        sparse_old_pool_size: int = 64,
+        soft_candidates_forward: bool = False,
         selector_dim: int = 128,
         token_temperature: float = 1.0,
         retrieval_temperature: float = 1.0,
@@ -518,6 +524,14 @@ class ROSA(nn.Module):
             )
         if virtual_candidates <= 0 or virtual_pool_size < virtual_candidates:
             raise ValueError("virtual_pool_size must be >= virtual_candidates > 0")
+        if dense_recent_candidates < 0:
+            raise ValueError("dense_recent_candidates must be >= 0")
+        if sparse_old_candidates < 0 or sparse_old_pool_size < sparse_old_candidates:
+            raise ValueError(
+                "sparse_old_pool_size must be >= sparse_old_candidates >= 0"
+            )
+        if not isinstance(soft_candidates_forward, bool):
+            raise TypeError("soft_candidates_forward must be a bool")
         if selector_dim <= 0:
             raise ValueError("selector_dim must be > 0")
         if token_temperature <= 0 or retrieval_temperature <= 0:
@@ -540,6 +554,10 @@ class ROSA(nn.Module):
         self.soft_verify_window = soft_verify_window
         self.virtual_candidates = virtual_candidates
         self.virtual_pool_size = virtual_pool_size
+        self.dense_recent_candidates = dense_recent_candidates
+        self.sparse_old_candidates = sparse_old_candidates
+        self.sparse_old_pool_size = sparse_old_pool_size
+        self.soft_candidates_forward = soft_candidates_forward
         self.selector_dim = selector_dim
         self.token_temperature = token_temperature
         self.retrieval_temperature = retrieval_temperature
@@ -692,6 +710,81 @@ class ROSA(nn.Module):
         e2 = g2 @ self.symbol_embedding_2.weight
         return (e1 + e2) * mask.unsqueeze(-1).to(e1.dtype)
 
+    def _hybrid_soft_candidates(
+        self,
+        st1: Tensor,
+        st2: Tensor,
+        exact_source: Tensor,
+        exact_mask: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Build separately budgeted recent and old soft-only candidates."""
+
+        bsz, n, _ = exact_source.shape
+        device = exact_source.device
+        dense_count = self.dense_recent_candidates
+        sparse_count = self.sparse_old_candidates
+
+        positions = torch.arange(n, device=device).view(1, n, 1)
+        if dense_count:
+            offsets = torch.arange(1, dense_count + 1, device=device).view(1, 1, -1)
+            dense_source = (positions - offsets).expand(bsz, -1, -1)
+            dense_mask = dense_source >= 0
+            dense_duplicate = (
+                dense_source.unsqueeze(-1) == exact_source.unsqueeze(-2)
+            ) & exact_mask.unsqueeze(-2)
+            dense_mask = dense_mask & ~dense_duplicate.any(dim=-1)
+        else:
+            dense_source = torch.empty((bsz, n, 0), dtype=torch.long, device=device)
+            dense_mask = torch.empty((bsz, n, 0), dtype=torch.bool, device=device)
+
+        if not sparse_count:
+            sparse_source = torch.empty((bsz, n, 0), dtype=torch.long, device=device)
+            sparse_mask = torch.empty((bsz, n, 0), dtype=torch.bool, device=device)
+            return dense_source, dense_mask, sparse_source, sparse_mask
+
+        pool_size = self.sparse_old_pool_size
+        # H is constant: evenly spaced anchors cover the admissible old range.
+        # Build every position in one tensor operation; a Python loop here
+        # would launch O(N) tiny CUDA kernels. The strict upper bound keeps old
+        # and recent quotas disjoint.
+        old_count = (torch.arange(n, device=device) - dense_count).clamp_min(0)
+        anchor_rank = torch.arange(pool_size, device=device).view(1, -1)
+        valid_anchors = anchor_rank < old_count.clamp_max(pool_size).view(-1, 1)
+        if pool_size == 1:
+            position_anchors = torch.zeros((n, 1), dtype=torch.long, device=device)
+        else:
+            spread = torch.round(
+                anchor_rank * (old_count - 1).clamp_min(0).view(-1, 1) / (pool_size - 1)
+            ).to(torch.long)
+            position_anchors = torch.where(
+                old_count.view(-1, 1) <= pool_size,
+                anchor_rank.expand(n, -1),
+                spread,
+            )
+        pool = position_anchors.unsqueeze(0).expand(bsz, -1, -1)
+        pool_mask = valid_anchors.unsqueeze(0).expand(bsz, -1, -1)
+        hard_duplicate = (
+            pool.unsqueeze(-1) == exact_source.unsqueeze(-2)
+        ) & exact_mask.unsqueeze(-2)
+        dense_duplicate = (
+            pool.unsqueeze(-1) == dense_source.unsqueeze(-2)
+        ) & dense_mask.unsqueeze(-2)
+        pool_mask = (
+            pool_mask & ~hard_duplicate.any(dim=-1) & ~dense_duplicate.any(dim=-1)
+        )
+        pool_score = self._soft_match(st1, st2, pool, pool_mask).masked_fill(
+            ~pool_mask, -1e9
+        )
+
+        # Stable lexicographic order: score descending, then source descending.
+        recency_order = torch.argsort(pool, dim=-1, descending=True, stable=True)
+        ordered_score = pool_score.gather(-1, recency_order)
+        score_order = torch.argsort(ordered_score, dim=-1, descending=True, stable=True)
+        selected = recency_order.gather(-1, score_order)[..., :sparse_count]
+        sparse_source = pool.gather(-1, selected)
+        sparse_mask = pool_mask.gather(-1, selected)
+        return dense_source, dense_mask, sparse_source, sparse_mask
+
     def forward(
         self,
         z_a: Tensor,
@@ -726,24 +819,59 @@ class ROSA(nn.Module):
         virtual_mask = virtual_mask & (self.virtual_scale > 0)
         virtual_router = virtual_router * self.virtual_scale
 
+        dense_source, dense_mask, sparse_source, sparse_mask = (
+            self._hybrid_soft_candidates(st1, st2, exact_source, exact_mask)
+        )
+
         bsz, n, _ = z_a.shape
         null_source = torch.full((bsz, n, 1), -1, dtype=torch.long, device=z_a.device)
         null_mask = torch.ones((bsz, n, 1), dtype=torch.bool, device=z_a.device)
-        source = torch.cat([exact_source, virtual_source, null_source], dim=-1)
-        mask = torch.cat([exact_mask, virtual_mask, null_mask], dim=-1)
+        source = torch.cat(
+            [
+                exact_source,
+                virtual_source,
+                dense_source,
+                sparse_source,
+                null_source,
+            ],
+            dim=-1,
+        )
+        mask = torch.cat(
+            [exact_mask, virtual_mask, dense_mask, sparse_mask, null_mask], dim=-1
+        )
 
         exact_kind = torch.full_like(exact_source, EXACT_KIND)
         virtual_kind = torch.full_like(virtual_source, VIRTUAL_KIND)
+        dense_kind = torch.full_like(dense_source, VIRTUAL_KIND)
+        sparse_kind = torch.full_like(sparse_source, VIRTUAL_KIND)
         null_kind = torch.full_like(null_source, NULL_KIND)
-        kind = torch.cat([exact_kind, virtual_kind, null_kind], dim=-1)
+        kind = torch.cat(
+            [exact_kind, virtual_kind, dense_kind, sparse_kind, null_kind], dim=-1
+        )
 
         zeros_virtual = torch.zeros_like(virtual_source)
+        zeros_dense = torch.zeros_like(dense_source)
+        zeros_sparse = torch.zeros_like(sparse_source)
         zeros_null = torch.zeros_like(null_source)
         hard_match_length = torch.cat(
-            [hard.match_length, zeros_virtual, zeros_null], dim=-1
+            [
+                hard.match_length,
+                zeros_virtual,
+                zeros_dense,
+                zeros_sparse,
+                zeros_null,
+            ],
+            dim=-1,
         )
         frequency = torch.cat(
-            [hard.frequency, torch.ones_like(virtual_source), zeros_null], dim=-1
+            [
+                hard.frequency,
+                torch.ones_like(virtual_source),
+                torch.ones_like(dense_source),
+                torch.ones_like(sparse_source),
+                zeros_null,
+            ],
+            dim=-1,
         )
 
         non_null_mask = mask & (kind != NULL_KIND)
@@ -809,15 +937,32 @@ class ROSA(nn.Module):
         # Curriculum gate for virtual candidates. At zero, the virtual branch
         # is effectively disabled while exact suffix and NULL candidates remain.
         virtual_log_gate = torch.log(self.virtual_scale.clamp_min(1e-6))
-        rosa_prior = rosa_prior + is_virtual * virtual_log_gate
+        legacy_virtual = torch.zeros_like(is_virtual)
+        legacy_virtual[..., exact_slots : exact_slots + self.virtual_candidates] = 1.0
+        rosa_prior = rosa_prior + legacy_virtual * virtual_log_gate
 
         scores = rosa_prior + self.learned_residual_scale * learned
         scores = scores.masked_fill(~mask, -1e9)
 
         soft_weights = F.softmax(scores / self.retrieval_temperature, dim=-1)
-        chosen = scores.argmax(dim=-1)
+        hard_scores = scores
+        if not self.soft_candidates_forward:
+            soft_start = exact_slots + self.virtual_candidates
+            soft_end = (
+                soft_start + self.dense_recent_candidates + self.sparse_old_candidates
+            )
+            soft_only = torch.zeros_like(mask)
+            soft_only[..., soft_start:soft_end] = True
+            hard_scores = scores.masked_fill(soft_only, -1e9)
+        chosen = hard_scores.argmax(dim=-1)
         hard_weights = F.one_hot(chosen, num_classes=scores.shape[-1]).to(z_a.dtype)
-        st_weights = hard_weights + soft_weights - soft_weights.detach()
+        if self.dense_recent_candidates or self.sparse_old_candidates:
+            # Parenthesizing the zero-valued correction makes the forward
+            # exactly one-hot while retaining the full-union softmax backward.
+            st_weights = hard_weights + (soft_weights - soft_weights.detach())
+        else:
+            # Preserve the historical arithmetic when both new budgets are 0.
+            st_weights = hard_weights + soft_weights - soft_weights.detach()
 
         next_position = torch.where(non_null_mask, source + 1, torch.zeros_like(source))
         symbolic_value = self._candidate_symbolic_values(
@@ -832,7 +977,48 @@ class ROSA(nn.Module):
         value_gate = value_gate * non_null_mask.to(z_a.dtype)
         neural_value = self.value_proj(next_z) * value_gate.unsqueeze(-1)
         candidate_value = symbolic_value + self.neural_value_scale * neural_value
-        retrieved = torch.sum(st_weights.unsqueeze(-1) * candidate_value, dim=-2)
+        hybrid_enabled = bool(
+            self.dense_recent_candidates or self.sparse_old_candidates
+        )
+        if hybrid_enabled and not self.soft_candidates_forward:
+            # Recreate the historical [hard, legacy virtual, NULL] reduction
+            # exactly, then replace only its soft backward correction with the
+            # full-union correction. The parenthesized delta is exactly zero
+            # in forward arithmetic.
+            historical_end = exact_slots + self.virtual_candidates
+            historical_scores = torch.cat(
+                [scores[..., :historical_end], scores[..., -1:]], dim=-1
+            )
+            historical_values = torch.cat(
+                [
+                    candidate_value[..., :historical_end, :],
+                    candidate_value[..., -1:, :],
+                ],
+                dim=-2,
+            )
+            historical_soft = F.softmax(
+                historical_scores / self.retrieval_temperature, dim=-1
+            )
+            historical_chosen = historical_scores.argmax(dim=-1)
+            historical_hard = F.one_hot(
+                historical_chosen, num_classes=historical_scores.shape[-1]
+            ).to(z_a.dtype)
+            historical_st = historical_hard + historical_soft - historical_soft.detach()
+            historical_retrieved = torch.sum(
+                historical_st.unsqueeze(-1) * historical_values, dim=-2
+            )
+            union_soft_retrieved = torch.sum(
+                soft_weights.unsqueeze(-1) * candidate_value, dim=-2
+            )
+            historical_soft_retrieved = torch.sum(
+                historical_soft.unsqueeze(-1) * historical_values, dim=-2
+            )
+            backward_delta = union_soft_retrieved - historical_soft_retrieved
+            retrieved = historical_retrieved + (
+                backward_delta - backward_delta.detach()
+            )
+        else:
+            retrieved = torch.sum(st_weights.unsqueeze(-1) * candidate_value, dim=-2)
 
         read_gate = torch.sigmoid(self.read_gate_head(z_a))
         updated = z_b + read_gate * self.out_proj(retrieved)
@@ -866,9 +1052,7 @@ class ROSA(nn.Module):
         )
         rosa_prob = soft_weights.gather(-1, rosa_target.unsqueeze(-1)).squeeze(-1)
         hard_prob = soft_weights.gather(-1, chosen.unsqueeze(-1)).squeeze(-1)
-        virtual_slice = soft_weights[
-            ..., exact_slots : exact_slots + self.virtual_candidates
-        ]
+        virtual_slice = soft_weights[..., exact_slots:-1]
         aux_losses = {
             "rosa_distillation": -torch.log(rosa_prob.clamp_min(eps)).mean(),
             "hard_soft_consistency": -torch.log(hard_prob.clamp_min(eps)).mean(),
@@ -978,6 +1162,50 @@ def _make_inference_impl(
             "Numba inference requires `pip install rosa-torch[numba]`"
         ) from error
     return _init_inference_state(batch_size, max_length)
+
+
+def init_candidate_state(
+    batch_size: int,
+    max_length: int,
+    *,
+    suffix_k: int = 16,
+    occurrences_r: int = 4,
+) -> Any:
+    """Allocate the exact bounded rich-candidate inference state.
+
+    This optional path requires the ``numba`` extra. It tracks K suffix states,
+    top-R occurrences and unbounded frequencies without eager suffix-chain
+    propagation.
+    """
+
+    try:
+        from ._stateful_candidates_numba import init_candidate_state as initialize
+    except ModuleNotFoundError as error:
+        if error.name == "numba":
+            raise RuntimeError(
+                "rich stateful candidates require the 'numba' extra"
+            ) from error
+        raise  # pragma: no cover - unrelated optional import failure
+    return initialize(
+        batch_size,
+        max_length,
+        suffix_k=suffix_k,
+        occurrences_r=occurrences_r,
+    )
+
+
+def forward_candidates_step(state: object, tokens: Tensor) -> Any:
+    """Consume one token and return exact bounded hard candidates."""
+
+    try:
+        from ._stateful_candidates_numba import forward_candidates_step as step
+    except ModuleNotFoundError as error:
+        if error.name == "numba":
+            raise RuntimeError(
+                "rich stateful candidates require the 'numba' extra"
+            ) from error
+        raise  # pragma: no cover - unrelated optional import failure
+    return step(cast(Any, state), tokens)
 
 
 def init_inference_state(

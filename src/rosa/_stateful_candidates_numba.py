@@ -694,7 +694,9 @@ def _step_batch_kernel(
     last: np.ndarray,
     size: np.ndarray,
     edge_count: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[  # pragma: no cover - executed as compiled Numba code
+    np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray
+]:
     slots = suffix_k * occurrences_r
     batch_size = tokens.shape[0]
     source = np.full((batch_size, slots), -1, dtype=np.int64)
