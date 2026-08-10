@@ -634,13 +634,6 @@ class _StatefulInferenceState:
     last: np.ndarray
     size: np.ndarray
     edge_count: np.ndarray
-    cuda_device: torch.device | None
-    cuda_input: Tensor | None
-    cuda_input_event: torch.cuda.Event | None
-    cuda_outputs: list[Tensor] | None
-    cuda_output_events: list[torch.cuda.Event] | None
-    cuda_output_used: list[bool] | None
-    cuda_output_slot: int
 
 
 def _init_inference_state(
@@ -686,81 +679,7 @@ def _init_inference_state(
         last=np.zeros(batch_size, dtype=np.int32),
         size=np.ones(batch_size, dtype=np.int32),
         edge_count=np.zeros(batch_size, dtype=np.int32),
-        cuda_device=None,
-        cuda_input=None,
-        cuda_input_event=None,
-        cuda_outputs=None,
-        cuda_output_events=None,
-        cuda_output_used=None,
-        cuda_output_slot=0,
     )
-
-
-def _cuda_forward_step(  # pragma: no cover - exercised on CUDA CI/benchmarks
-    state: _StatefulInferenceState,
-    tokens: Tensor,
-) -> Tensor:
-    device = tokens.device
-    if state.cuda_device != device:
-        state.cuda_device = device
-        state.cuda_input = torch.empty(
-            state.batch_size, dtype=torch.long, device="cpu", pin_memory=True
-        )
-        state.cuda_input_event = torch.cuda.Event()
-        state.cuda_outputs = [
-            torch.empty(
-                state.batch_size, dtype=torch.long, device="cpu", pin_memory=True
-            )
-            for _ in range(4)
-        ]
-        state.cuda_output_events = [torch.cuda.Event() for _ in range(4)]
-        state.cuda_output_used = [False] * 4
-        state.cuda_output_slot = 0
-
-    assert state.cuda_input is not None
-    assert state.cuda_input_event is not None
-    assert state.cuda_outputs is not None
-    assert state.cuda_output_events is not None
-    assert state.cuda_output_used is not None
-    stream = torch.cuda.current_stream(device)
-    state.cuda_input.copy_(tokens, non_blocking=True)
-    state.cuda_input_event.record(stream)
-    state.cuda_input_event.synchronize()
-    output = _step_batch_kernel(
-        state.cuda_input.numpy(),
-        state.position,
-        state.history,
-        state.head,
-        state.edge_token,
-        state.edge_target,
-        state.edge_next,
-        state.hash_state,
-        state.hash_token,
-        state.hash_edge,
-        state.suffix_link,
-        state.length,
-        state.lct_left,
-        state.lct_right,
-        state.lct_parent,
-        state.lct_value,
-        state.lct_lazy,
-        state.lct_lazy_valid,
-        state.lct_stack,
-        state.last,
-        state.size,
-        state.edge_count,
-    )
-    slot = state.cuda_output_slot
-    if state.cuda_output_used[slot]:
-        state.cuda_output_events[slot].synchronize()
-    pinned_output = state.cuda_outputs[slot]
-    pinned_output.copy_(torch.from_numpy(output))
-    result = pinned_output.to(device, non_blocking=True)
-    state.cuda_output_events[slot].record(stream)
-    state.cuda_output_used[slot] = True
-    state.cuda_output_slot = (slot + 1) % len(state.cuda_outputs)
-    state.position += 1
-    return result
 
 
 def _forward_step(state: _StatefulInferenceState, tokens: Tensor) -> Tensor:
@@ -773,8 +692,6 @@ def _forward_step(state: _StatefulInferenceState, tokens: Tensor) -> Tensor:
     if state.position >= state.max_length:
         raise RuntimeError("inference state capacity exceeded")
     device = tokens.device
-    if device.type == "cuda":  # pragma: no cover - exercised on CUDA benchmarks
-        return _cuda_forward_step(state, tokens)
     cpu_tokens = tokens.detach().to(device="cpu", dtype=torch.long).contiguous()
     output = _step_batch_kernel(
         cpu_tokens.numpy(),
