@@ -9,6 +9,11 @@ from rosa import reference_rosa
 
 try:
     from rosa._numba_backend import predict_exact
+    from rosa._stateful_numba import (
+        _forward_step,
+        _init_inference_state,
+        predict_exact_stateful,
+    )
 except ModuleNotFoundError as error:
     if error.name not in {"numba", "numpy"}:
         raise
@@ -50,6 +55,28 @@ class TestNumbaBackend(unittest.TestCase):
         assert predict_exact is not None
         with self.assertRaisesRegex(ValueError, "shape"):
             predict_exact(torch.zeros(1, 2, 3, dtype=torch.long))
+
+    def test_stateful_private_validation_and_full_replay(self) -> None:
+        with self.assertRaisesRegex(ValueError, "batch_size"):
+            _init_inference_state(0, 1)
+        with self.assertRaisesRegex(ValueError, "max_length"):
+            _init_inference_state(1, 0)
+
+        state = _init_inference_state(1, 1)
+        self.assertEqual(_forward_step(state, torch.tensor(0)).shape, (1,))
+        with self.assertRaisesRegex(ValueError, "shape"):
+            _forward_step(state, torch.tensor([1, 2]))
+
+        empty = torch.empty(0, dtype=torch.long)
+        self.assertTrue(torch.equal(predict_exact_stateful(empty), empty))
+        empty_batch = torch.empty((2, 0), dtype=torch.long)
+        self.assertEqual(tuple(predict_exact_stateful(empty_batch).shape), (2, 0))
+        with self.assertRaisesRegex(ValueError, "shape"):
+            predict_exact_stateful(torch.zeros(1, 2, 3, dtype=torch.long))
+
+        tokens = torch.tensor([0, 1, 0, 2, 0], dtype=torch.long)
+        expected, _, _ = reference_rosa(tokens)
+        self.assertTrue(torch.equal(predict_exact_stateful(tokens), expected))
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
     def test_cuda_round_trip_matches_reference(self) -> None:

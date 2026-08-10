@@ -362,8 +362,8 @@ def _step_row(  # pragma: no cover - executed as compiled Numba code
                     edge_next,
                     edge_count,
                     clone,
-                    edge_token[edge],
-                    edge_target[edge],
+                    int(edge_token[edge]),
+                    int(edge_target[edge]),
                 )
                 edge = edge_next[edge]
             while (

@@ -45,12 +45,19 @@ The virtual-candidate branch and neural value residual have independent curricul
 
 - Python 3.10+
 - PyTorch
+- Optional Numba backend for production exact inference
 - `coverage`, Ruff, and Pyright for development
 
 Install the published package from PyPI:
 
 ```bash
 uv add rosa-torch
+```
+
+Install the stateful Link-Cut Tree backend with:
+
+```bash
+uv add 'rosa-torch[numba]'
 ```
 
 Install the package and its locked development dependencies with [uv](https://docs.astral.sh/uv/):
@@ -73,16 +80,49 @@ PEP 517-compatible Python package manager.
 ├── README.md
 ├── src
 │   └── rosa
-│       └── __init__.py
+│       ├── __init__.py
+│       ├── _numba_backend.py
+│       └── _stateful_numba.py
 └── tests
     ├── __init__.py
     ├── run_coverage.py
+    ├── test_inference.py
+    ├── test_numba_backend.py
     └── test_rosa.py
 ```
 
-The implementation is distributed as an installable `rosa` package while
-remaining in one source module to keep the exact suffix-automaton and neural
-retrieval paths easy to inspect together.
+The implementation is distributed as an installable `rosa` package. The core
+neural path remains in `__init__.py`; optional compiled inference kernels are
+isolated in private backend modules and loaded lazily.
+
+## Stateful exact inference
+
+Use one explicit state per independent decoding stream. The automaton remains
+on CPU, while CUDA token inputs receive CUDA predictions through a single
+batch transfer per step.
+
+```python
+import torch
+
+from rosa import forward_step, init_inference_state
+
+state = init_inference_state(
+    batch_size=2,
+    max_length=32_768,
+    backend="auto",  # "numba" when installed, otherwise exact Python
+)
+
+for token in generated_token_ids:  # each tensor has shape [2]
+    predicted_token = forward_step(state, token)
+
+state.reset()
+```
+
+Capacity is fixed at initialization for predictable memory use. Exceeding it
+raises `RuntimeError` before mutation. States are mutable, isolated, and must
+not be shared concurrently between decoding requests. `forward_step` implements
+exact top-1 ROSA; rich multi-candidate training remains on the full-sequence
+`ROSA` path.
 
 ## Quick start
 
@@ -263,11 +303,12 @@ tensors are returned to the original PyTorch device. Accelerator backends such
 as TileLang or Triton should optimize only the differentiable tensor path around
 the automaton.
 
-The current implementation performs this CPU work synchronously and rebuilds
-the automaton for each full-sequence call. Production autoregressive inference
-can improve throughput with a stateful CPU worker whose automaton updates are
-pipelined alongside GPU layers, while preserving the same exact candidate
-semantics and PyTorch fallback.
+The stateful inference API retains the suffix automaton across decoding steps.
+Its Numba backend uses a rooted Link-Cut Tree for lazy suffix-path timestamp
+updates, replacing the previous quadratic eager propagation with amortized
+`O(log N)` updates. Full stateful prefill is fused into one compiled replay
+kernel; the explicit Python fallback preserves exact semantics without making
+Numba a base dependency.
 
 ## Design guarantees
 

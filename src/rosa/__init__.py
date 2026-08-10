@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass
-from typing import cast
+from dataclasses import dataclass, field
+from typing import Any, Literal, cast
 
 import torch
 import torch.nn.functional as F
@@ -25,11 +25,14 @@ __all__ = [
     "EXACT_KIND",
     "NULL_KIND",
     "ROSA",
+    "ROSAInferenceState",
     "VIRTUAL_KIND",
     "HardCandidates",
     "ROSAOutput",
     "build_hard_candidates",
     "build_virtual_pool_indices",
+    "forward_step",
+    "init_inference_state",
     "reference_rosa",
 ]
 
@@ -244,6 +247,46 @@ class _OnlineSuffixAutomaton:
             if len(bucket) > self.occurrences_r:
                 del bucket[0]
             v = self.link[v]
+
+
+@dataclass
+class _PythonInferenceState:
+    batch_size: int
+    max_length: int
+    position: int
+    automata: list[_OnlineSuffixAutomaton]
+    history: list[list[int]]
+
+
+def _init_python_inference_state(
+    batch_size: int,
+    max_length: int,
+) -> _PythonInferenceState:
+    return _PythonInferenceState(
+        batch_size=batch_size,
+        max_length=max_length,
+        position=0,
+        automata=[_OnlineSuffixAutomaton(max_length, 1) for _ in range(batch_size)],
+        history=[[] for _ in range(batch_size)],
+    )
+
+
+def _python_forward_step(state: _PythonInferenceState, tokens: Tensor) -> Tensor:
+    if state.position >= state.max_length:
+        raise RuntimeError("inference state capacity exceeded")
+    device = tokens.device
+    predictions: list[int] = []
+    for batch_index, token in enumerate(tokens.detach().cpu().tolist()):
+        value = int(token)
+        history = state.history[batch_index]
+        automaton = state.automata[batch_index]
+        history.append(value)
+        automaton.extend(value)
+        candidates = automaton.read_candidates(1, 1)
+        predictions.append(history[candidates[0][0] + 1] if candidates else -1)
+        automaton.write_current_end(state.position)
+    state.position += 1
+    return torch.tensor(predictions, dtype=torch.long, device=device)
 
 
 def _build_single_hard_candidates(
@@ -884,3 +927,123 @@ class ROSA(nn.Module):
             + balance_weight * aux_losses["code_balance"]
             + virtual_weight * aux_losses["virtual_usage"]
         )
+
+
+InferenceBackend = Literal["auto", "python", "numba"]
+
+
+@dataclass(slots=True)
+class ROSAInferenceState:
+    """Mutable, fixed-capacity state for exact autoregressive ROSA inference.
+
+    Create states with :func:`init_inference_state`. Each state is independent,
+    CPU-resident, and intended to be mutated by one decoding stream at a time.
+    """
+
+    batch_size: int
+    max_length: int
+    backend: Literal["python", "numba"]
+    _impl: object = field(repr=False)
+
+    @property
+    def position(self) -> int:
+        """Number of tokens consumed by every batch row."""
+
+        return int(cast(Any, self._impl).position)
+
+    def reset(self) -> None:
+        """Reset all batch rows while retaining the configured capacity."""
+
+        self._impl = _make_inference_impl(
+            self.batch_size,
+            self.max_length,
+            self.backend,
+        )
+
+
+def _make_inference_impl(
+    batch_size: int,
+    max_length: int,
+    backend: Literal["python", "numba"],
+) -> object:
+    if backend == "python":
+        return _init_python_inference_state(batch_size, max_length)
+    try:
+        from ._stateful_numba import _init_inference_state
+    except ModuleNotFoundError as error:
+        if error.name not in {"numba", "numpy"}:
+            raise
+        raise ImportError(
+            "Numba inference requires `pip install rosa-torch[numba]`"
+        ) from error
+    return _init_inference_state(batch_size, max_length)
+
+
+def init_inference_state(
+    batch_size: int,
+    max_length: int = 8192,
+    *,
+    backend: InferenceBackend = "auto",
+) -> ROSAInferenceState:
+    """Create an explicit state for exact top-1 autoregressive ROSA inference.
+
+    ``backend="auto"`` selects the Link-Cut Tree Numba backend when the
+    optional dependency is installed and otherwise uses the exact Python
+    fallback. Capacity is fixed so memory use and failure behavior remain
+    predictable in production.
+    """
+
+    if batch_size <= 0:
+        raise ValueError("batch_size must be > 0")
+    if max_length <= 0:
+        raise ValueError("max_length must be > 0")
+    if backend not in {"auto", "python", "numba"}:
+        raise ValueError("backend must be 'auto', 'python', or 'numba'")
+
+    selected: Literal["python", "numba"]
+    if backend == "auto":
+        try:
+            impl = _make_inference_impl(batch_size, max_length, "numba")
+            selected = "numba"
+        except ImportError:
+            impl = _make_inference_impl(batch_size, max_length, "python")
+            selected = "python"
+    else:
+        selected = backend
+        impl = _make_inference_impl(batch_size, max_length, selected)
+    return ROSAInferenceState(batch_size, max_length, selected, impl)
+
+
+def forward_step(state: ROSAInferenceState, token: Tensor) -> Tensor:
+    """Consume one token per batch row and return exact ROSA predictions.
+
+    ``token`` must be an integer tensor shaped ``[batch_size]``. A scalar is
+    also accepted when ``batch_size == 1`` and produces a scalar prediction.
+    The state remains on CPU; the prediction is returned on the token device.
+    """
+
+    if not isinstance(state, ROSAInferenceState):
+        raise TypeError("state must be a ROSAInferenceState")
+    if not isinstance(token, Tensor):
+        raise TypeError("token must be a torch.Tensor")
+    squeeze = token.ndim == 0
+    if squeeze and state.batch_size == 1:
+        token = token.unsqueeze(0)
+    if token.ndim != 1 or token.shape[0] != state.batch_size:
+        raise ValueError("token must have shape [batch_size]")
+    if token.dtype not in {
+        torch.uint8,
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+    }:
+        raise TypeError("token must use an integer dtype")
+
+    if state.backend == "python":
+        output = _python_forward_step(cast(_PythonInferenceState, state._impl), token)
+    else:
+        from ._stateful_numba import _forward_step
+
+        output = _forward_step(cast(Any, state._impl), token)
+    return output[0] if squeeze else output
