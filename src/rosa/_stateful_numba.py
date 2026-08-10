@@ -998,6 +998,7 @@ class _StatefulInferenceState:
 
     batch_size: int
     max_length: int
+    native_abi_version: int
     position: int
     history: np.ndarray
     head: np.ndarray
@@ -1044,6 +1045,7 @@ def _init_inference_state(
     return _StatefulInferenceState(
         batch_size=batch_size,
         max_length=max_length,
+        native_abi_version=1,
         position=0,
         history=np.empty((batch_size, max_length), dtype=np.int64),
         head=np.full(state_shape, -1, dtype=np.int32),

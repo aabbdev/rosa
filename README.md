@@ -60,6 +60,15 @@ Install the stateful Link-Cut Tree backend with:
 uv add 'rosa-torch[numba]'
 ```
 
+For the lowest CPU step latency, install a locally built native companion wheel
+(or a published wheel once multi-ABI releases are enabled):
+
+```bash
+uv pip install native/dist/rosa_torch_native-0.2.0-*.whl
+```
+
+The stateful backend detects it lazily and otherwise falls back to Numba.
+
 Install the package and its locked development dependencies with [uv](https://docs.astral.sh/uv/):
 
 ```bash
