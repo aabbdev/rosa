@@ -1,6 +1,15 @@
 # ROSA as Differentiable Sparse Retrieval with an Exact Suffix Automaton
 
-ROSA is a PyTorch module for long-range associative retrieval over an internal discrete code stream. It uses an exact online suffix automaton as a sparse candidate generator, while keeping tokenization, candidate ranking, and value retrieval differentiable.
+This repository is an independent PyTorch implementation and differentiable
+extension of **RWKV-8 ROSA (Rapid Online Suffix Automaton)**, described by
+[Bo Peng (BlinkDL)](https://github.com/BlinkDL) in
+[RWKV-8 ROSA: Beyond Attention](https://www.rwkv.com/images/RWKV-8-ROSA.png)
+on [rwkv.com](https://www.rwkv.com/#rwkv-8-explained).
+
+The implementation provides long-range associative retrieval over an internal
+discrete code stream. It uses an exact online suffix automaton as a sparse
+candidate generator, while keeping tokenization, candidate ranking, and value
+retrieval differentiable.
 
 The design avoids a trainable dense automaton transition tensor and avoids dense all-pairs attention over sequence positions. The discrete suffix-automaton structure remains exact; learning is concentrated on how symbols are produced and how a small causal candidate set is ranked and read.
 
@@ -257,14 +266,14 @@ The current suffix-automaton control path is written in Python and stores bounde
 - Disabling virtual candidates does not affect the exact suffix branch or NULL candidate.
 - No dense trainable state-to-token-to-state transition tensor is used.
 
-## Acknowledgements
+## Attribution
 
-ROSA gratefully acknowledges [Bo Peng (BlinkDL)](https://github.com/BlinkDL),
-creator of [RWKV](https://www.rwkv.com/), for advancing efficient long-context
-sequence modeling through architectures that combine RNN-style linear-time
-inference with Transformer-style parallel training. The community can be found
-on the official
+ROSA is an algorithm described by Bo Peng for RWKV-8. This package implements
+and extends that algorithm; it does not claim authorship of ROSA itself. For
+the original definition, pseudocode, and design notes, see
+[RWKV-8 ROSA: Beyond Attention](https://www.rwkv.com/images/RWKV-8-ROSA.png)
+on [rwkv.com](https://www.rwkv.com/#rwkv-8-explained).
+
+The implementation in this repository is independently maintained and is not
+an official RWKV distribution. The RWKV community can be found on the official
 [RWKV Discord server](https://discord.gg/bDSBUMeFpc).
-
-ROSA is an independent project and is not affiliated with or endorsed by Bo
-Peng or the RWKV project.

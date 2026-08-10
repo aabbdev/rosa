@@ -4,8 +4,8 @@ build-backend = "uv_build"
 
 [project]
 name = "rosa-torch"
-version = "0.1.0"
-description = "Differentiable sparse retrieval backed by an exact suffix automaton"
+version = "0.1.1"
+description = "Independent PyTorch implementation of RWKV-8 ROSA with exact suffix-automaton retrieval"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
@@ -21,7 +21,7 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-authors = [
+maintainers = [
     { name = "Lucas", email = "30107107+aabbdev@users.noreply.github.com" },
 ]
 dependencies = ["torch"]
@@ -29,6 +29,7 @@ dependencies = ["torch"]
 [project.urls]
 Repository = "https://github.com/aabbdev/rosa"
 Issues = "https://github.com/aabbdev/rosa/issues"
+"Original ROSA description" = "https://www.rwkv.com/#rwkv-8-explained"
 
 [dependency-groups]
 dev = [
