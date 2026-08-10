@@ -608,6 +608,390 @@ def _replay_kernel(  # pragma: no cover - executed as compiled Numba code
     return output
 
 
+@njit(cache=True, nogil=True, inline="always")
+def _range_max(  # pragma: no cover - executed as compiled Numba code
+    tree: np.ndarray,
+    base: int,
+    start: int,
+    stop: int,
+) -> int:
+    result = -1
+    left = base + start
+    right = base + stop
+    while left < right:
+        if left & 1:
+            if tree[left] > result:
+                result = int(tree[left])
+            left += 1
+        if right & 1:
+            right -= 1
+            if tree[right] > result:
+                result = int(tree[right])
+        left >>= 1
+        right >>= 1
+    return result
+
+
+@njit(cache=True, nogil=True, inline="always")
+def _point_max(  # pragma: no cover - executed as compiled Numba code
+    tree: np.ndarray,
+    base: int,
+    index: int,
+    value: int,
+) -> None:
+    node = base + index
+    if tree[node] >= value:
+        return
+    tree[node] = value
+    node >>= 1
+    while node != 0:
+        updated = tree[node << 1]
+        if tree[(node << 1) | 1] > updated:
+            updated = tree[(node << 1) | 1]
+        if tree[node] == updated:
+            break
+        tree[node] = updated
+        node >>= 1
+
+
+@njit(cache=True, nogil=True, inline="always")
+def _fenwick_prefix(  # pragma: no cover - executed as compiled Numba code
+    tree: np.ndarray,
+    stop: int,
+) -> int:
+    result = 0
+    node = stop
+    while node > 0:
+        result += int(tree[node])
+        node -= node & -node
+    return result
+
+
+@njit(cache=True, nogil=True, inline="always")
+def _fenwick_add(  # pragma: no cover - executed as compiled Numba code
+    tree: np.ndarray,
+    index: int,
+) -> None:
+    node = index + 1
+    while node < tree.shape[0]:
+        tree[node] += 1
+        node += node & -node
+
+
+@njit(cache=True, nogil=True, inline="always")
+def _fenwick_select(  # pragma: no cover - executed as compiled Numba code
+    tree: np.ndarray,
+    rank: int,
+) -> int:
+    """Return the zero-based position of a one-based order statistic."""
+
+    node = 0
+    step = 1
+    size = tree.shape[0] - 1
+    while (step << 1) <= size:
+        step <<= 1
+    while step != 0:
+        candidate = node + step
+        if candidate <= size and tree[candidate] < rank:
+            node = candidate
+            rank -= int(tree[candidate])
+        step >>= 1
+    return node
+
+
+@njit(cache=True, nogil=True, inline="always")
+def _tree_lca(  # pragma: no cover - executed as compiled Numba code
+    up: np.ndarray,
+    tin: np.ndarray,
+    tout: np.ndarray,
+    first: int,
+    second: int,
+) -> int:
+    if tin[first] <= tin[second] and tout[second] <= tout[first]:
+        return first
+    if tin[second] <= tin[first] and tout[first] <= tout[second]:
+        return second
+    current = first
+    for level in range(up.shape[0] - 1, -1, -1):
+        ancestor = up[level, current]
+        if ancestor != -1 and not (
+            tin[ancestor] <= tin[second] and tout[second] <= tout[ancestor]
+        ):
+            current = ancestor
+    return int(up[0, current])
+
+
+@njit(cache=True, nogil=True)
+def _bulk_prefill_row(  # pragma: no cover - executed as compiled Numba code
+    tokens: np.ndarray,
+    history: np.ndarray,
+    head: np.ndarray,
+    edge_token: np.ndarray,
+    edge_target: np.ndarray,
+    edge_next: np.ndarray,
+    hash_state: np.ndarray,
+    hash_token: np.ndarray,
+    hash_edge: np.ndarray,
+    suffix_link: np.ndarray,
+    length: np.ndarray,
+    lct_left: np.ndarray,
+    lct_right: np.ndarray,
+    lct_parent: np.ndarray,
+    lct_value: np.ndarray,
+    lct_lazy_valid: np.ndarray,
+) -> tuple[np.ndarray, int, int, int]:
+    """Build the final SAM, answer prefixes offline, and seed the LCT."""
+
+    token_count = tokens.shape[0]
+    output = np.full(token_count, -1, dtype=np.int64)
+    prefix_state = np.empty(token_count, dtype=np.int32)
+    last = 0
+    size = 1
+    edge_count = 0
+
+    for position in range(token_count):
+        token = int(tokens[position])
+        history[position] = token
+        if size >= head.shape[0]:
+            raise RuntimeError("suffix automaton state capacity exceeded")
+        current = size
+        size += 1
+        length[current] = length[last] + 1
+        state = last
+        while (
+            state != -1
+            and _find_transition(hash_state, hash_token, hash_edge, state, token) == -1
+        ):
+            edge_count = _add_transition(
+                head,
+                edge_token,
+                edge_target,
+                edge_next,
+                hash_state,
+                hash_token,
+                hash_edge,
+                edge_count,
+                state,
+                token,
+                current,
+            )
+            state = suffix_link[state]
+
+        if state == -1:
+            suffix_link[current] = 0
+        else:
+            transition = _find_transition(
+                hash_state, hash_token, hash_edge, state, token
+            )
+            target = int(edge_target[transition])
+            if length[state] + 1 == length[target]:
+                suffix_link[current] = target
+            else:
+                if size >= head.shape[0]:
+                    raise RuntimeError("suffix automaton state capacity exceeded")
+                clone = size
+                size += 1
+                length[clone] = length[state] + 1
+                suffix_link[clone] = suffix_link[target]
+                edge = head[target]
+                while edge != -1:
+                    edge_count = _add_transition(
+                        head,
+                        edge_token,
+                        edge_target,
+                        edge_next,
+                        hash_state,
+                        hash_token,
+                        hash_edge,
+                        edge_count,
+                        clone,
+                        int(edge_token[edge]),
+                        int(edge_target[edge]),
+                    )
+                    edge = edge_next[edge]
+                transition = _find_transition(
+                    hash_state, hash_token, hash_edge, state, token
+                )
+                while (
+                    state != -1
+                    and transition != -1
+                    and edge_target[transition] == target
+                ):
+                    _replace_transition(
+                        edge_target,
+                        hash_state,
+                        hash_token,
+                        hash_edge,
+                        state,
+                        token,
+                        clone,
+                    )
+                    state = suffix_link[state]
+                    if state != -1:
+                        transition = _find_transition(
+                            hash_state, hash_token, hash_edge, state, token
+                        )
+                suffix_link[target] = clone
+                suffix_link[current] = clone
+
+        last = current
+        prefix_state[position] = current
+
+    first_child = np.full(size, -1, dtype=np.int32)
+    next_sibling = np.full(size, -1, dtype=np.int32)
+    for node in range(1, size):
+        parent = suffix_link[node]
+        next_sibling[node] = first_child[parent]
+        first_child[parent] = node
+    tin = np.empty(size, dtype=np.int32)
+    tout = np.empty(size, dtype=np.int32)
+    euler_node = np.empty(size, dtype=np.int32)
+    dfs_nodes = np.empty(size, dtype=np.int32)
+    dfs_next = np.empty(size, dtype=np.int32)
+    depth = 0
+    timer = 0
+    dfs_nodes[0] = 0
+    dfs_next[0] = first_child[0]
+    tin[0] = timer
+    euler_node[timer] = 0
+    timer += 1
+    while depth >= 0:
+        child = dfs_next[depth]
+        if child == -1:
+            tout[dfs_nodes[depth]] = timer
+            depth -= 1
+        else:
+            dfs_next[depth] = next_sibling[child]
+            depth += 1
+            dfs_nodes[depth] = child
+            dfs_next[depth] = first_child[child]
+            tin[child] = timer
+            euler_node[timer] = child
+            timer += 1
+
+    levels = 1
+    span = 1
+    while span < size:
+        levels += 1
+        span <<= 1
+    up = np.full((levels, size), -1, dtype=np.int32)
+    for node in range(size):
+        up[0, node] = suffix_link[node]
+    for level in range(1, levels):
+        for node in range(size):
+            ancestor = up[level - 1, node]
+            if ancestor != -1:
+                up[level, node] = up[level - 1, ancestor]
+
+    base = 1
+    while base < size:
+        base <<= 1
+    active = np.full(base << 1, -1, dtype=np.int64)
+    active_order = np.zeros(size + 1, dtype=np.int32)
+    for position in range(token_count):
+        node = int(suffix_link[prefix_state[position]])
+        if node != -1:
+            # Among a DFS-ordered set, one of the predecessor/successor has
+            # the deepest LCA with the query node.  Thus two order-statistic
+            # lookups replace a path of segment-tree range probes.
+            node_tin = int(tin[node])
+            preceding_count = _fenwick_prefix(active_order, node_tin + 1)
+            best = 0
+            if preceding_count > 0:
+                preceding_tin = _fenwick_select(active_order, preceding_count)
+                best = _tree_lca(up, tin, tout, node, int(euler_node[preceding_tin]))
+            before_count = _fenwick_prefix(active_order, node_tin)
+            if before_count < position:
+                following_tin = _fenwick_select(active_order, before_count + 1)
+                candidate = _tree_lca(
+                    up, tin, tout, node, int(euler_node[following_tin])
+                )
+                if length[candidate] > length[best]:
+                    best = candidate
+            node = best
+            source = _range_max(active, base, int(tin[node]), int(tout[node]))
+            if node != 0 and source >= 0:
+                output[position] = history[source + 1]
+        _point_max(active, base, int(tin[prefix_state[position]]), position)
+        _fenwick_add(active_order, int(tin[prefix_state[position]]))
+
+    latest_end = np.full(size, -1, dtype=np.int64)
+    for position in range(token_count):
+        latest_end[prefix_state[position]] = position
+    counts = np.zeros(token_count + 1, dtype=np.int32)
+    for node in range(size):
+        counts[length[node]] += 1
+    for index in range(1, counts.shape[0]):
+        counts[index] += counts[index - 1]
+    order = np.empty(size, dtype=np.int32)
+    for node in range(size - 1, -1, -1):
+        node_length = length[node]
+        counts[node_length] -= 1
+        order[counts[node_length]] = node
+    for index in range(size - 1, 0, -1):
+        node = order[index]
+        parent = suffix_link[node]
+        if latest_end[node] > latest_end[parent]:
+            latest_end[parent] = latest_end[node]
+    for node in range(size):
+        lct_left[node] = -1
+        lct_right[node] = -1
+        lct_parent[node] = suffix_link[node]
+        lct_value[node] = latest_end[node]
+        lct_lazy_valid[node] = 0
+
+    return output, last, size, edge_count
+
+
+@njit(cache=True, nogil=True)
+def _bulk_prefill_kernel(  # pragma: no cover - executed as compiled Numba code
+    tokens: np.ndarray,
+    history: np.ndarray,
+    head: np.ndarray,
+    edge_token: np.ndarray,
+    edge_target: np.ndarray,
+    edge_next: np.ndarray,
+    hash_state: np.ndarray,
+    hash_token: np.ndarray,
+    hash_edge: np.ndarray,
+    suffix_link: np.ndarray,
+    length: np.ndarray,
+    lct_left: np.ndarray,
+    lct_right: np.ndarray,
+    lct_parent: np.ndarray,
+    lct_value: np.ndarray,
+    lct_lazy_valid: np.ndarray,
+    last: np.ndarray,
+    size: np.ndarray,
+    edge_count: np.ndarray,
+) -> np.ndarray:
+    output = np.empty(tokens.shape, dtype=np.int64)
+    for batch_index in range(tokens.shape[0]):
+        row_output, row_last, row_size, row_edge_count = _bulk_prefill_row(
+            tokens[batch_index],
+            history[batch_index],
+            head[batch_index],
+            edge_token[batch_index],
+            edge_target[batch_index],
+            edge_next[batch_index],
+            hash_state[batch_index],
+            hash_token[batch_index],
+            hash_edge[batch_index],
+            suffix_link[batch_index],
+            length[batch_index],
+            lct_left[batch_index],
+            lct_right[batch_index],
+            lct_parent[batch_index],
+            lct_value[batch_index],
+            lct_lazy_valid[batch_index],
+        )
+        output[batch_index] = row_output
+        last[batch_index] = row_last
+        size[batch_index] = row_size
+        edge_count[batch_index] = row_edge_count
+    return output
+
+
 @dataclass
 class _StatefulInferenceState:
     """Fixed-capacity, independently batched exact ROSA inference state."""
@@ -758,7 +1142,7 @@ def _prefill(state: _StatefulInferenceState, tokens: Tensor) -> Tensor:
     if tokens.shape[1] == 0:
         return torch.empty(tokens.shape, dtype=torch.long, device=device)
     cpu_tokens = tokens.detach().to(device="cpu", dtype=torch.long).contiguous()
-    output_array = _replay_kernel(
+    output_array = _bulk_prefill_kernel(
         cpu_tokens.numpy(),
         state.history,
         state.head,
@@ -774,9 +1158,7 @@ def _prefill(state: _StatefulInferenceState, tokens: Tensor) -> Tensor:
         state.lct_right,
         state.lct_parent,
         state.lct_value,
-        state.lct_lazy,
         state.lct_lazy_valid,
-        state.lct_stack,
         state.last,
         state.size,
         state.edge_count,
