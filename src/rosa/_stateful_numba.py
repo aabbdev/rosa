@@ -721,6 +721,46 @@ def _forward_step(state: _StatefulInferenceState, tokens: Tensor) -> Tensor:
     return torch.from_numpy(output).to(device)
 
 
+def _prefill(state: _StatefulInferenceState, tokens: Tensor) -> Tensor:
+    """Consume a full initial context through one fused compiled replay."""
+
+    if state.position != 0:
+        raise RuntimeError("prefill requires an empty inference state")
+    if tokens.ndim != 2 or tokens.shape[0] != state.batch_size:
+        raise ValueError("tokens must have shape [batch_size, sequence_length]")
+    if tokens.shape[1] > state.max_length:
+        raise RuntimeError("inference state capacity exceeded")
+    device = tokens.device
+    if tokens.shape[1] == 0:
+        return torch.empty(tokens.shape, dtype=torch.long, device=device)
+    cpu_tokens = tokens.detach().to(device="cpu", dtype=torch.long).contiguous()
+    output_array = _replay_kernel(
+        cpu_tokens.numpy(),
+        state.history,
+        state.head,
+        state.edge_token,
+        state.edge_target,
+        state.edge_next,
+        state.hash_state,
+        state.hash_token,
+        state.hash_edge,
+        state.suffix_link,
+        state.length,
+        state.lct_left,
+        state.lct_right,
+        state.lct_parent,
+        state.lct_value,
+        state.lct_lazy,
+        state.lct_lazy_valid,
+        state.lct_stack,
+        state.last,
+        state.size,
+        state.edge_count,
+    )
+    state.position = tokens.shape[1]
+    return torch.from_numpy(output_array).to(device)
+
+
 def predict_exact_stateful(tokens: Tensor) -> Tensor:
     """Return exact top-1 ROSA predictions through the stateful Numba backend."""
 

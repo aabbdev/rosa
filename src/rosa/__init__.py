@@ -33,6 +33,7 @@ __all__ = [
     "build_virtual_pool_indices",
     "forward_step",
     "init_inference_state",
+    "prefill",
     "reference_rosa",
 ]
 
@@ -1046,4 +1047,53 @@ def forward_step(state: ROSAInferenceState, token: Tensor) -> Tensor:
         from ._stateful_numba import _forward_step
 
         output = _forward_step(cast(Any, state._impl), token)
+    return output[0] if squeeze else output
+
+
+def prefill(state: ROSAInferenceState, tokens: Tensor) -> Tensor:
+    """Consume an initial context and return exact ROSA predictions.
+
+    The state must be empty. ``tokens`` uses shape ``[batch_size, N]``; a
+    one-dimensional context is accepted when ``batch_size == 1``. The Numba
+    backend fuses the complete replay into one compiled call.
+    """
+
+    if not isinstance(state, ROSAInferenceState):
+        raise TypeError("state must be a ROSAInferenceState")
+    if not isinstance(tokens, Tensor):
+        raise TypeError("tokens must be a torch.Tensor")
+    squeeze = tokens.ndim == 1
+    if squeeze and state.batch_size == 1:
+        tokens = tokens.unsqueeze(0)
+    if tokens.ndim != 2 or tokens.shape[0] != state.batch_size:
+        raise ValueError("tokens must have shape [batch_size, sequence_length]")
+    if tokens.dtype not in {
+        torch.uint8,
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+    }:
+        raise TypeError("tokens must use an integer dtype")
+    if state.position != 0:
+        raise RuntimeError("prefill requires an empty inference state")
+    if tokens.shape[1] > state.max_length:
+        raise RuntimeError("inference state capacity exceeded")
+
+    if state.backend == "python":
+        backend_state = cast(_PythonInferenceState, state._impl)
+        if tokens.shape[1] == 0:
+            output = torch.empty(tokens.shape, dtype=torch.long, device=tokens.device)
+        else:
+            output = torch.stack(
+                [
+                    _python_forward_step(backend_state, tokens[:, position])
+                    for position in range(tokens.shape[1])
+                ],
+                dim=1,
+            )
+    else:
+        from ._stateful_numba import _prefill
+
+        output = _prefill(cast(Any, state._impl), tokens)
     return output[0] if squeeze else output

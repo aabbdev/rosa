@@ -11,6 +11,7 @@ from rosa import (
     ROSAInferenceState,
     forward_step,
     init_inference_state,
+    prefill,
     reference_rosa,
 )
 
@@ -77,6 +78,49 @@ class TestStatefulInference(unittest.TestCase):
         _, output = self.collect(tokens, backend="numba")
         expected, _, _ = reference_rosa(tokens)
         self.assertTrue(torch.equal(output, expected))
+
+    def test_prefill_then_continuation_matches_reference(self) -> None:
+        generator = torch.Generator().manual_seed(20260811)
+        tokens = torch.randint(257, (3, 96), generator=generator)
+        for backend in ("python", "numba"):
+            with self.subTest(backend=backend):
+                state = init_inference_state(3, 96, backend=backend)
+                initial = prefill(state, tokens[:, :64])
+                continuation = torch.stack(
+                    [forward_step(state, tokens[:, index]) for index in range(64, 96)],
+                    dim=1,
+                )
+                output = torch.cat((initial, continuation), dim=1)
+                expected, _, _ = reference_rosa(tokens)
+                self.assertTrue(torch.equal(output, expected))
+                self.assertEqual(state.position, 96)
+
+        scalar_state = init_inference_state(1, 4, backend="numba")
+        scalar_tokens = torch.tensor([0, 1, 0, 2])
+        self.assertEqual(tuple(prefill(scalar_state, scalar_tokens).shape), (4,))
+
+    def test_prefill_validation_empty_and_capacity(self) -> None:
+        state = init_inference_state(2, 3, backend="numba")
+        empty = prefill(state, torch.empty((2, 0), dtype=torch.long))
+        self.assertEqual(tuple(empty.shape), (2, 0))
+        self.assertEqual(state.position, 0)
+        python_state = init_inference_state(2, 3, backend="python")
+        python_empty = prefill(python_state, torch.empty((2, 0), dtype=torch.long))
+        self.assertEqual(tuple(python_empty.shape), (2, 0))
+        with self.assertRaisesRegex(ValueError, "shape"):
+            prefill(state, torch.zeros((1, 2), dtype=torch.long))
+        with self.assertRaisesRegex(TypeError, "integer"):
+            prefill(state, torch.zeros((2, 2)))
+        with self.assertRaisesRegex(RuntimeError, "capacity"):
+            prefill(state, torch.zeros((2, 4), dtype=torch.long))
+
+        prefill(state, torch.zeros((2, 1), dtype=torch.long))
+        with self.assertRaisesRegex(RuntimeError, "empty"):
+            prefill(state, torch.zeros((2, 1), dtype=torch.long))
+        with self.assertRaisesRegex(TypeError, "state"):
+            prefill(cast(Any, object()), torch.zeros((2, 1), dtype=torch.long))
+        with self.assertRaisesRegex(TypeError, "Tensor"):
+            prefill(state, cast(Any, [[0], [0]]))
 
     def test_auto_backend_and_validation(self) -> None:
         state = init_inference_state(1, backend="auto")

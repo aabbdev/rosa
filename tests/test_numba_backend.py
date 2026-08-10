@@ -12,6 +12,7 @@ try:
     from rosa._stateful_numba import (
         _forward_step,
         _init_inference_state,
+        _prefill,
         predict_exact_stateful,
     )
 except ModuleNotFoundError as error:
@@ -66,6 +67,15 @@ class TestNumbaBackend(unittest.TestCase):
         self.assertEqual(_forward_step(state, torch.tensor(0)).shape, (1,))
         with self.assertRaisesRegex(ValueError, "shape"):
             _forward_step(state, torch.tensor([1, 2]))
+
+        prefill_state = _init_inference_state(1, 1)
+        with self.assertRaisesRegex(ValueError, "shape"):
+            _prefill(prefill_state, torch.zeros((2, 1), dtype=torch.long))
+        with self.assertRaisesRegex(RuntimeError, "capacity"):
+            _prefill(prefill_state, torch.zeros((1, 2), dtype=torch.long))
+        _prefill(prefill_state, torch.zeros((1, 1), dtype=torch.long))
+        with self.assertRaisesRegex(RuntimeError, "empty"):
+            _prefill(prefill_state, torch.zeros((1, 0), dtype=torch.long))
 
         empty = torch.empty(0, dtype=torch.long)
         self.assertTrue(torch.equal(predict_exact_stateful(empty), empty))
