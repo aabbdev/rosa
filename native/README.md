@@ -1,113 +1,122 @@
 # `rosa-torch-native`
 
-Compagnon natif optionnel de [`rosa-torch`](https://github.com/aabbdev/rosa)
-pour l'étape d'inférence exacte SAM + Link-Cut Tree sur CPU. La distribution
-installe le module d'extension importable `rosa_native_step`; elle ne remplace
-pas le package Python principal.
+Optional native companion for
+[`rosa-torch`](https://github.com/aabbdev/rosa), accelerating the exact CPU
+suffix-automaton and Link-Cut Tree inference step. The distribution installs
+the importable `rosa_native_step` extension module; it does not replace the
+main Python package.
 
-Le cœur C++ est la copie exacte du prototype validé
-`benchmark/production-opt-20260811/native/native_step.cpp`. Il lie une fois les
-tableaux NumPy d'un `_StatefulInferenceState`, les modifie sur place et libère
-le GIL pendant le calcul. Il n'inclut ni n'appelle libtorch. La dépendance
-runtime `rosa-torch[numba]>=0.2,<0.3` fournit le contrat d'état compatible,
-PyTorch, NumPy et Numba.
+The C++ core implements the validated exact production state machine. It binds
+the NumPy arrays of a `_StatefulInferenceState` once, updates them in place,
+and releases the GIL during computation. It neither includes nor calls
+libtorch. The runtime dependency `rosa-torch[numba]>=0.2,<0.3` provides the
+compatible state contract together with PyTorch, NumPy, and Numba.
 
-Le constructeur valide intégralement formes, types, compteurs et version ABI
-avant de conserver les pointeurs. L'ABI d'état native actuelle vaut `1`.
+The constructor validates every shape, dtype, counter, and ABI version before
+retaining any pointer. The current native state ABI is `1`.
 
-Le module expose aussi `NativeCandidateState` pour l'état riche exact de
-`rosa._stateful_candidates_numba`. Son `step` batch maintient les mêmes K
-suffixes, R occurrences les plus récentes, fréquences non bornées et tags LCT
-`newest-prefix + delta`. La capacité R reste possédée par les tableaux NumPy du
-`CandidateState` Python, dont l'objet natif conserve la durée de vie. La
-capacité peut être détectée via la présence de `NativeCandidateState` et
-`candidate_abi_version == 1`.
+The module also exposes `NativeCandidateState` for the exact rich state in
+`rosa._stateful_candidates_numba`. Its batched `step` maintains the same K
+suffixes, R newest occurrences, unbounded frequencies, and
+`newest-prefix + delta` LCT tags as the Python/Numba implementation. The R
+capacity remains owned by the NumPy arrays of the Python `CandidateState`, whose
+lifetime is retained by the native object. Capability can be detected through
+the presence of `NativeCandidateState` and `candidate_abi_version == 1`.
 
-L'ABI riche conserve `step`, `reset` global et `position`, et détecte par
-capacité les extensions `prefill`, `step_masked`, `reset_masked` et
-`positions`. `prefill` émet les cinq tableaux natifs à chaque position dans un
-seul appel C++ et laisse l'état continuable. Le mode ragged possède une position
-par ligne; les chemins uniformes et ragged sont volontairement incompatibles
-afin qu'une seule autorité de position existe à tout instant. Le wrapper Python
-retombe exactement sur Numba lorsqu'un ancien wheel ABI 1 ne fournit pas ces
-méthodes optionnelles.
+The rich ABI retains `step`, global `reset`, and `position`, while detecting the
+optional `prefill`, `step_masked`, `reset_masked`, `positions`, `step_into`, and
+`prefill_into` capabilities. `prefill` emits all five native arrays at every
+position in one C++ call and leaves the state ready for continuation. The
+caller-owned `*_into` methods avoid repeated output allocation after validating
+dtype, shape, contiguity, writability, and memory overlap.
 
-## Installation et utilisation
+Ragged mode stores one position per row. Uniform and ragged paths are
+intentionally incompatible so that exactly one position authority exists at
+any time. The Python wrapper falls back exactly to Numba when an older ABI-1
+wheel does not provide a newer optional method.
 
-Installez un wheel correspondant à la version de Python et à la plateforme :
+## Installation and usage
+
+`rosa-torch-native` is not currently published on PyPI. Build a wheel from a
+Git checkout using the target Python interpreter, then install the matching
+wheel for the current platform and ABI:
 
 ```bash
-python -m pip install rosa-torch-native
+git clone https://github.com/aabbdev/rosa.git
+cd rosa
+uv sync --extra numba
+uv build --python .venv/bin/python --wheel native --out-dir native/dist
+uv pip install --python .venv/bin/python \
+  native/dist/rosa_torch_native-0.2.0-*.whl
 ```
 
-`rosa-torch` détecte automatiquement le module dans son backend d'inférence
-Numba. L'API bas niveau reste disponible pour diagnostic :
+`rosa-torch` detects the extension automatically from its Numba inference
+backend. The low-level API remains available for diagnostics:
 
 ```python
 from rosa_native_step import NativeState
 ```
 
-`NativeState(state).step(tokens_numpy)` attend un vecteur NumPy contigu
-convertible en `int64`, de forme `[batch_size]`. L'objet conserve une référence
-à l'état Python et expose sa `position` en lecture seule.
+`NativeState(state).step(tokens_numpy)` expects a contiguous NumPy vector of
+shape `[batch_size]` that is convertible to `int64`. The object retains a
+reference to the Python state and exposes its read-only `position`.
 
-`NativeCandidateState(candidate_state).step(tokens_numpy)` attend strictement
-un vecteur NumPy C-contigu `int64` et renvoie le tuple bas niveau
-`(source, match_length, state_id, frequency, count)`. `reset()` recycle tout le
-batch en temps proportionnel aux états et slots de hachage réellement occupés.
+`NativeCandidateState(candidate_state).step(tokens_numpy)` requires a
+C-contiguous `int64` NumPy vector and returns the low-level tuple
+`(source, match_length, state_id, frequency, count)`. `reset()` recycles the
+whole batch in time proportional to the state nodes and hash slots that are
+actually occupied.
 
-Chaque état natif crée à la demande un petit pool C++17 persistant, sans
-dépendance, qui parallélise les lignes indépendantes des prefill top-1 et
-riches. Les prefills
-conservent aussi leur chemin série pour les batchs inférieurs à 4, où le réveil d'un
-worker coûte plus cher que le calcul mesuré. Les steps uniformes ne l'emploient
-qu'à partir d'un batch de 64 afin de conserver le
-chemin série peu coûteux des petits batchs. Le pool est limité par le batch, le
-nombre de CPU annoncé et 16 threads; `ROSA_NATIVE_THREADS=1` force le chemin
-série, et une valeur entière positive fixe une limite plus basse. Une valeur
-absente sélectionne automatiquement la limite disponible, tandis qu'une valeur
-invalide retombe prudemment à un thread. Seules les chaînes non vides composées
-exclusivement de chiffres et représentant une valeur strictement positive sont
-acceptées.
+Each native state lazily creates a small dependency-free persistent C++17
+thread pool. It parallelizes independent batch rows for top-1 and rich prefill.
+Prefill keeps a serial path below batch 4, where waking a worker costs more than
+the measured computation. Uniform steps use the pool only from batch 64 onward
+to preserve the inexpensive serial path for small batches.
 
-Le pool par état évite le cycle de vie fragile d'un singleton d'extension et
-n'appelle jamais Python depuis ses workers. Aucun worker n'est donc créé pour
-un état ragged ni pour un batch inférieur à 4 qui n'utilise jamais de prefill.
-Son coût éventuel est la création d'au plus 15 threads au premier appel assez
-grand; ils sont réutilisés jusqu'à sa destruction. Les appels mutateurs
-concurrents sur une même instance sont
-sérialisés par un mutex acquis GIL libéré, sans modifier les allocations ni les
-tableaux de sortie publics. Les exceptions C++ des workers sont capturées puis
-relancées sur le thread appelant.
+The pool is bounded by the batch size, reported CPU count, and 16 total threads.
+`ROSA_NATIVE_THREADS=1` forces the serial path; another positive integer sets a
+lower cap. An unset variable selects the available limit automatically,
+while an invalid value falls back conservatively to one thread. Only non-empty
+digit strings representing a strictly positive integer are accepted.
 
-## Construction locale isolée
+Using one pool per state avoids fragile extension-singleton shutdown ordering,
+and workers never call Python. No worker is created for a ragged state or a
+batch below 4 that never uses prefill. A sufficiently large first call may
+create at most 15 workers, which are reused until state destruction. Concurrent
+mutating calls on the same instance are serialized by a mutex acquired while
+the GIL is released. Public output allocation and array ownership remain
+unchanged. Worker exceptions are captured and rethrown on the calling thread.
 
-Le backend PEP 517 est setuptools, avec pybind11 uniquement comme dépendance de
-construction. `Pybind11Extension` sélectionne C++17 et setuptools fournit les
-options d'extension propres à macOS/Linux; `-O3` et `NDEBUG` sont ajoutés sur
-les deux plateformes.
+## Isolated local build
 
-Depuis la racine du dépôt :
+The PEP 517 backend is setuptools, with setuptools, wheel, and pybind11 as build
+dependencies. `Pybind11Extension` selects C++17, while setuptools provides the
+platform extension flags for macOS and Linux. Both platforms additionally use
+`-O3` and `NDEBUG`.
+
+From the repository root:
 
 ```bash
-uv build --wheel native --out-dir /tmp/rosa-native-dist
+uv sync --extra numba
+uv build --python .venv/bin/python --wheel native \
+  --out-dir /tmp/rosa-native-dist
 uv run --isolated \
   --with '.[numba]' \
   --with /tmp/rosa-native-dist/rosa_torch_native-0.2.0-*.whl \
   native/tests/smoke.py
 ```
 
-Le smoke force Numba comme oracle, laisse le chemin ROSA courant charger le
-compagnon, puis compare les prédictions étape par étape.
+The smoke test forces Numba as the oracle, lets the regular ROSA path load the
+companion, and compares predictions step by step.
 
-Le smoke riche et le benchmark direct contre Numba se lancent respectivement
-avec `native/tests/candidate_smoke.py` et `native/benchmark_candidates.py` dans
-le même environnement isolé.
+Run the rich smoke test and direct Numba comparison with
+`native/tests/candidate_smoke.py` and `native/benchmark_candidates.py`,
+respectively, in the same isolated environment.
 
-## Publication multi-plateforme
+## Multi-platform publication
 
-Étape suivante : ajouter un workflow `cibuildwheel` dédié après avoir fixé la
-matrice Python/architectures, les cibles Linux (manylinux) et la politique de
-publication. Aucun workflow n'est ajouté ici afin de ne pas publier une
-matrice non validée; chaque wheel contient du code natif et doit être produit
-séparément par ABI et plateforme.
+The next publication step is a dedicated `cibuildwheel` workflow after defining
+the supported Python and architecture matrix, manylinux targets, and release
+policy. No such workflow is included yet because an unvalidated matrix must not
+be published. Every wheel contains native code and must be built separately for
+each Python ABI and platform.

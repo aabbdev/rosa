@@ -95,6 +95,7 @@ requires per-platform and per-Python ABI wheels:
 ```bash
 git clone https://github.com/aabbdev/rosa.git
 cd rosa
+uv sync --extra numba
 uv build --wheel native --out-dir native/dist
 uv pip install native/dist/rosa_torch_native-0.2.0-*.whl
 ```
