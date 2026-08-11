@@ -349,6 +349,8 @@ class TestROSASemantics(unittest.TestCase):
                 self.assertTrue(torch.equal(actual.grad, expected.grad), actual_name)
 
     def test_stateful_forward_does_not_call_eager_or_suffix_write(self) -> None:
+        from rosa._stateful_candidates_numba import prefill_candidates
+
         tokens = torch.tensor([[0, 1, 0, 2, 0, 1]], dtype=torch.long)
         logits = factor_logits_from_tokens(tokens, (2, 3))
         expected = _build_forward_hard_candidates(tokens, 3, 2, "python")
@@ -359,21 +361,59 @@ class TestROSASemantics(unittest.TestCase):
         )
         with (
             patch("rosa.build_hard_candidates", side_effect=AssertionError("eager")),
+            patch(
+                "rosa._stateful_candidates_numba.forward_candidates_step",
+                side_effect=AssertionError("step"),
+            ),
+            patch(
+                "rosa._stateful_candidates_numba.prefill_candidates",
+                wraps=prefill_candidates,
+            ) as prefill_mock,
             patch.object(
                 rosa._OnlineSuffixAutomaton,
                 "write_current_end",
                 side_effect=AssertionError("suffix write"),
             ),
         ):
-            hard = _build_forward_hard_candidates(tokens, 3, 2, "stateful")
             output = model(torch.randn(1, 6, 8), code_logits=logits)
-        for name in expected.__dataclass_fields__:
-            self.assertTrue(
-                torch.equal(getattr(hard, name), getattr(expected, name)), name
-            )
+        prefill_mock.assert_called_once()
         self.assertTrue(
             torch.equal(output.hard_rosa_source_index, expected.rosa_source_index)
         )
+
+    def test_stateful_prefill_reuses_full_sequence_candidate_tensors(self) -> None:
+        from rosa._stateful_candidates_numba import prefill_candidates
+
+        tokens = torch.tensor([[0, 1, 0, 2, 0, 1]], dtype=torch.long)
+        captured = None
+
+        def capture_prefill(state, full_tokens):
+            nonlocal captured
+            captured = prefill_candidates(state, full_tokens)
+            return captured
+
+        with patch(
+            "rosa._stateful_candidates_numba.prefill_candidates",
+            side_effect=capture_prefill,
+        ):
+            hard = _build_forward_hard_candidates(tokens, 3, 2, "stateful")
+
+        assert captured is not None
+        for name in hard.__dataclass_fields__:
+            self.assertIs(getattr(hard, name), getattr(captured, name), name)
+
+    def test_stateful_full_sequence_preserves_scalar_batch_squeeze(self) -> None:
+        tokens = torch.tensor([0, 1, 0, 2, 0, 1], dtype=torch.long)
+        expected = _build_forward_hard_candidates(tokens, 3, 2, "python")
+        actual = _build_forward_hard_candidates(tokens, 3, 2, "stateful")
+        for name in expected.__dataclass_fields__:
+            self.assertTrue(
+                torch.equal(getattr(actual, name), getattr(expected, name)), name
+            )
+        with self.assertRaisesRegex(ValueError, r"\[N\].*\[B, N\]"):
+            _build_forward_hard_candidates(
+                torch.zeros((1, 1, 1), dtype=torch.long), 3, 2, "stateful"
+            )
 
     def test_auto_fallback_is_limited_to_missing_optional_dependencies(self) -> None:
         tokens = torch.tensor([[0, 1, 0]], dtype=torch.long)

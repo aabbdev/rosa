@@ -399,52 +399,32 @@ def _build_stateful_hard_candidates(
     suffix_k: int,
     occurrences_r: int,
 ) -> HardCandidates:
-    """Replay a full sequence through the exact bounded stateful backend."""
+    """Prefill a full sequence through the exact bounded stateful backend."""
 
-    from ._stateful_candidates_numba import forward_candidates_step as step
     from ._stateful_candidates_numba import init_candidate_state as initialize
+    from ._stateful_candidates_numba import prefill_candidates
 
-    cpu_tokens = tokens.detach().to(device="cpu", dtype=torch.long).contiguous()
-    batch_size, sequence_length = cpu_tokens.shape
+    squeeze = tokens.ndim == 1
+    if squeeze:
+        tokens = tokens.unsqueeze(0)
+    if tokens.ndim != 2:
+        raise ValueError("tokens must have shape [N] or [B, N]")
+
+    batch_size, sequence_length = tokens.shape
     state = initialize(
         batch_size,
         sequence_length,
         suffix_k=suffix_k,
         occurrences_r=occurrences_r,
     )
-    steps = [
-        step(state, cpu_tokens[:, position]) for position in range(sequence_length)
-    ]
-    stacked = {
-        name: torch.stack([getattr(item, name) for item in steps], dim=1)
-        for name in HardCandidates.__dataclass_fields__
-    }
-    candidate_fields = torch.stack(
-        [
-            stacked["source_index"],
-            stacked["match_length"],
-            stacked["state_id"],
-            stacked["frequency"],
-        ]
-    ).to(tokens.device)
-    rosa_fields = torch.stack(
-        [
-            stacked["rosa_slot"],
-            stacked["rosa_source_index"],
-            stacked["rosa_match_length"],
-            stacked["rosa_predicted_tokens"],
-        ]
-    ).to(tokens.device)
+    candidates = prefill_candidates(state, tokens)
+    result = HardCandidates(
+        *(getattr(candidates, name) for name in HardCandidates.__dataclass_fields__)
+    )
+    if not squeeze:
+        return result
     return HardCandidates(
-        source_index=candidate_fields[0],
-        match_length=candidate_fields[1],
-        state_id=candidate_fields[2],
-        frequency=candidate_fields[3],
-        mask=stacked["mask"].to(tokens.device),
-        rosa_slot=rosa_fields[0],
-        rosa_source_index=rosa_fields[1],
-        rosa_match_length=rosa_fields[2],
-        rosa_predicted_tokens=rosa_fields[3],
+        *(getattr(result, name)[0] for name in result.__dataclass_fields__)
     )
 
 
