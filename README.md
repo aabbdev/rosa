@@ -91,6 +91,8 @@ PEP 517-compatible Python package manager.
 │   └── rosa
 │       ├── __init__.py
 │       ├── _numba_backend.py
+│       ├── _stateful_candidates_numba.py
+│       ├── ragged.py
 │       └── _stateful_numba.py
 └── tests
     ├── __init__.py
@@ -133,6 +135,35 @@ not be shared concurrently between decoding requests. `forward_step` implements
 exact top-1 ROSA; rich multi-candidate training remains on the full-sequence
 `ROSA` path.
 
+The same facade also exposes exact rich candidates and independently advancing
+rows without allocating rich storage for top-1 states:
+
+```python
+rich = init_inference_state(
+    batch_size=8,
+    max_length=32_768,
+    mode="rich",
+    ragged=True,
+    suffix_k=16,
+    occurrences_r=4,
+)
+
+result = rich.step(
+    token_ids,
+    active=active_rows,
+    reset=recycled_rows,
+)
+predicted = result.predicted_tokens
+candidates = result.candidates
+positions = rich.positions
+```
+
+`mode="top1"` remains the default. Uniform states expose scalar `position`;
+all states expose a copied `positions` tensor. Rich and ragged modes require
+the `numba` extra and automatically use compatible native companion methods
+when installed. Legacy `forward_step`, `prefill`, `init_candidate_state`, and
+`forward_candidates_step` remain supported.
+
 ## Quick start
 
 ```python
@@ -156,6 +187,7 @@ model = ROSA(
     learned_residual_scale=0.0,
     virtual_scale=0.0,
     neural_value_scale=0.0,
+    candidate_backend="auto",  # stateful rich backend, Python oracle fallback
 )
 
 z_a = torch.randn(batch_size, sequence_length, d_model, requires_grad=True)
