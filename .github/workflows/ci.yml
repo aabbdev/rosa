@@ -34,7 +34,7 @@ jobs:
           enable-cache: true
 
       - name: Install locked dependencies
-        run: uv sync --locked --all-groups
+        run: uv sync --locked --all-groups --extra numba
 
       - name: Lint
         run: uv run ruff check .
@@ -54,3 +54,64 @@ jobs:
       - name: Build distributions
         if: matrix.python-version == '3.10'
         run: uv build
+
+  base-install:
+    name: Base install without Numba
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.8.15"
+          python-version: "3.10"
+          enable-cache: true
+
+      - name: Install base dependencies only
+        run: uv sync --locked --all-groups
+
+      - name: Verify automatic Python fallback
+        run: |
+          uv run python - <<'PY'
+          import torch
+          from rosa import forward_step, init_inference_state
+
+          state = init_inference_state(1, max_length=2)
+          assert state.backend == "python"
+          assert forward_step(state, torch.tensor(0)).item() == -1
+          PY
+
+  native-smoke:
+    name: Native companion Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.14"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825a76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.8.15"
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+
+      - name: Install ROSA with Numba
+        run: uv sync --locked --all-groups --extra numba
+
+      - name: Build and install native companion
+        run: |
+          uv build --python .venv/bin/python --wheel native --out-dir native/dist
+          uv pip install --python .venv/bin/python --no-deps --force-reinstall native/dist/*.whl
+
+      - name: Run native smoke test
+        run: uv run python native/tests/smoke.py
