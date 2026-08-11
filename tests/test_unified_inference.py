@@ -11,6 +11,7 @@ from rosa import (
     build_hard_candidates,
     forward_candidates_step,
     forward_step,
+    init_candidate_buffers,
     init_candidate_state,
     init_inference_state,
     prefill,
@@ -80,6 +81,30 @@ class TestUnifiedInferenceState(unittest.TestCase):
         old_state = init_candidate_state(1, 1, suffix_k=2, occurrences_r=2)
         old_output = forward_candidates_step(old_state, torch.tensor([7]))
         self.assertEqual(tuple(old_output.source_index.shape), (1, 4))
+
+    def test_rich_step_into_uses_explicit_ephemeral_storage(self) -> None:
+        rich = init_inference_state(2, 2, mode="rich", suffix_k=2, occurrences_r=2)
+        buffers = init_candidate_buffers(rich)
+        first = rich.step_into(torch.tensor([0, 3]), buffers)
+        self.assertIsNotNone(first.candidates)
+        second = rich.step_into(torch.tensor([0, 3]), buffers)
+        expected = build_hard_candidates(
+            torch.tensor([[0, 0], [3, 3]]), suffix_k=2, occurrences_r=2
+        )
+        assert second.candidates is not None
+        for field in HardCandidates.__dataclass_fields__:
+            self.assertTrue(
+                torch.equal(
+                    getattr(second.candidates, field), getattr(expected, field)[:, 1]
+                ),
+                field,
+            )
+
+        top1 = init_inference_state(1, 1)
+        with self.assertRaisesRegex(ValueError, "rich"):
+            init_candidate_buffers(top1)
+        with self.assertRaisesRegex(ValueError, "uniform rich"):
+            top1.step_into(torch.tensor([0]), buffers)
 
     def test_positions_are_copies_and_uniform_position_is_preserved(self) -> None:
         uniform = init_inference_state(2, 2)

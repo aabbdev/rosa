@@ -1005,6 +1005,47 @@ class CandidateStep:
     rosa_predicted_tokens: Tensor
 
 
+@dataclass(slots=True)
+class CandidateBuffers:
+    """Reusable packed CPU storage for opt-in immediate candidate consumption.
+
+    Results returned by ``*_into`` alias these arrays and remain valid only
+    until the buffers are reused. The historical allocating APIs never alias
+    a ``CandidateBuffers`` instance.
+    """
+
+    source_index: np.ndarray
+    match_length: np.ndarray
+    state_id: np.ndarray
+    frequency: np.ndarray
+    count: np.ndarray
+
+
+def init_candidate_buffers(
+    state: CandidateState, *, sequence_length: int | None = None
+) -> CandidateBuffers:
+    """Allocate packed caller-owned buffers for ``step_into`` or ``prefill_into``."""
+
+    if not isinstance(state, CandidateState):
+        raise TypeError("state must be a CandidateState")
+    if sequence_length is not None and sequence_length < 0:
+        raise ValueError("sequence_length must be >= 0")
+    slots = state.suffix_k * state.occurrences_r
+    prefix = (
+        (state.batch_size,)
+        if sequence_length is None
+        else (state.batch_size, sequence_length)
+    )
+    candidate_shape = (*prefix, slots)
+    return CandidateBuffers(
+        np.empty(candidate_shape, dtype=np.int64),
+        np.empty(candidate_shape, dtype=np.int64),
+        np.empty(candidate_shape, dtype=np.int64),
+        np.empty(candidate_shape, dtype=np.int64),
+        np.empty(prefix, dtype=np.int32),
+    )
+
+
 def init_candidate_state(
     batch_size: int,
     max_length: int,
@@ -1171,6 +1212,202 @@ def _candidate_step_from_arrays(
         rosa_match_length=torch.from_numpy(rosa_length).to(device),
         rosa_predicted_tokens=torch.from_numpy(rosa_predicted).to(device),
     )
+
+
+def _validate_candidate_buffers(
+    state: CandidateState,
+    buffers: CandidateBuffers,
+    tokens: np.ndarray,
+    *,
+    sequence_length: int | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    if not isinstance(buffers, CandidateBuffers):
+        raise TypeError("buffers must be CandidateBuffers")
+    slots = state.suffix_k * state.occurrences_r
+    prefix = (
+        (state.batch_size,)
+        if sequence_length is None
+        else (state.batch_size, sequence_length)
+    )
+    expected = (
+        ("source_index", buffers.source_index, np.dtype(np.int64), (*prefix, slots)),
+        ("match_length", buffers.match_length, np.dtype(np.int64), (*prefix, slots)),
+        ("state_id", buffers.state_id, np.dtype(np.int64), (*prefix, slots)),
+        ("frequency", buffers.frequency, np.dtype(np.int64), (*prefix, slots)),
+        ("count", buffers.count, np.dtype(np.int32), prefix),
+    )
+    arrays: list[np.ndarray] = []
+    for name, array, dtype, shape in expected:
+        if not isinstance(array, np.ndarray):
+            raise TypeError(f"buffers.{name} must be a numpy.ndarray")
+        if array.dtype != dtype:
+            raise TypeError(f"buffers.{name} has an unexpected dtype")
+        if array.shape != shape or not array.flags.c_contiguous:
+            raise ValueError(f"buffers.{name} must be C-contiguous with shape {shape}")
+        if not array.flags.writeable:
+            raise ValueError(f"buffers.{name} must be writable")
+        arrays.append(array)
+    all_call_arrays = [tokens, *arrays]
+    for first_index, first in enumerate(all_call_arrays):
+        for second in all_call_arrays[first_index + 1 :]:
+            if np.shares_memory(first, second):
+                raise ValueError("tokens and candidate buffers must not overlap")
+    state_arrays = [
+        value for value in state.__dict__.values() if isinstance(value, np.ndarray)
+    ]
+    for array in all_call_arrays:
+        if any(np.shares_memory(array, state_array) for state_array in state_arrays):
+            raise ValueError(
+                "candidate buffers must not overlap candidate state storage"
+            )
+    return arrays[0], arrays[1], arrays[2], arrays[3], arrays[4]
+
+
+def _native_candidate_into(
+    state: CandidateState,
+    method: str,
+    tokens: np.ndarray,
+    arrays: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+) -> bool:  # pragma: no cover - optional native companion
+    if state.native_state is False:
+        return False
+    if state.native_state is None:
+        try:
+            import rosa_native_step  # type: ignore[reportMissingImports]
+        except ModuleNotFoundError:
+            state.native_state = False
+            return False
+        native_type = getattr(rosa_native_step, "NativeCandidateState", None)
+        if native_type is None:
+            state.native_state = False
+            return False
+        state.native_state = native_type(state)
+    native_method = getattr(state.native_state, method, None)
+    if native_method is not None:
+        native_method(tokens, *arrays)
+        return True
+
+    # An ABI-1 wheel predating caller-owned buffers remains a valid exact
+    # backend: allocate through its historical method, then copy into storage.
+    allocating_method = getattr(state.native_state, method.removesuffix("_into"), None)
+    if allocating_method is None:
+        return False
+    allocated = allocating_method(tokens)
+    for destination, source in zip(arrays, allocated, strict=True):
+        np.copyto(destination, source)
+    return True
+
+
+def forward_candidates_step_into(
+    state: CandidateState, tokens: Tensor, buffers: CandidateBuffers
+) -> CandidateStep:
+    """Consume one token into reusable CPU buffers.
+
+    The returned tensors alias ``buffers`` and are intended for immediate
+    consumption. Use :func:`forward_candidates_step` for retained snapshots.
+    """
+
+    tokens, _ = _validate_candidate_tokens(state, tokens)
+    if state.ragged_mode:
+        raise RuntimeError("uniform step is unavailable on a ragged candidate state")
+    if state.position >= state.max_length:
+        raise RuntimeError("candidate state capacity exceeded")
+    device = tokens.device
+    cpu_tokens = tokens.detach().to(device="cpu", dtype=torch.long).contiguous()
+    token_array = cpu_tokens.numpy()
+    arrays = _validate_candidate_buffers(state, buffers, token_array)
+    if not _native_candidate_into(state, "step_into", token_array, arrays):
+        allocated = _step_batch_kernel(
+            token_array,
+            state.position,
+            state.suffix_k,
+            state.occurrences_r,
+            state.history,
+            state.head,
+            state.edge_token,
+            state.edge_target,
+            state.edge_next,
+            state.hash_state,
+            state.hash_token,
+            state.hash_edge,
+            state.suffix_link,
+            state.length,
+            state.lct_left,
+            state.lct_right,
+            state.lct_parent,
+            state.occurrences,
+            state.occurrence_size,
+            state.frequency,
+            state.lazy_prefix,
+            state.lazy_size,
+            state.lazy_delta,
+            state.lct_stack,
+            state.last,
+            state.size,
+            state.edge_count,
+        )
+        for destination, source in zip(arrays, allocated, strict=True):
+            np.copyto(destination, source)
+        state.position += 1
+        state.positions.fill(state.position)
+    else:
+        state.positions.fill(state.position)
+    return _candidate_step_from_arrays(state, arrays, device)
+
+
+def prefill_candidates_into(
+    state: CandidateState, tokens: Tensor, buffers: CandidateBuffers
+) -> CandidateStep:
+    """Consume a dense context into reusable packed CPU buffers."""
+
+    tokens, _ = _validate_candidate_tokens(state, tokens, sequence=True)
+    if state.ragged_mode:
+        raise RuntimeError("prefill is unavailable on a ragged candidate state")
+    if state.position != 0:
+        raise RuntimeError("prefill requires an empty candidate state")
+    sequence_length = tokens.shape[1]
+    if sequence_length > state.max_length:
+        raise RuntimeError("candidate state capacity exceeded")
+    device = tokens.device
+    cpu_tokens = tokens.detach().to(device="cpu", dtype=torch.long).contiguous()
+    token_array = cpu_tokens.numpy()
+    arrays = _validate_candidate_buffers(
+        state, buffers, token_array, sequence_length=sequence_length
+    )
+    if not _native_candidate_into(state, "prefill_into", token_array, arrays):
+        allocated = _prefill_candidate_kernel(
+            token_array,
+            state.suffix_k,
+            state.occurrences_r,
+            state.history,
+            state.head,
+            state.edge_token,
+            state.edge_target,
+            state.edge_next,
+            state.hash_state,
+            state.hash_token,
+            state.hash_edge,
+            state.suffix_link,
+            state.length,
+            state.lct_left,
+            state.lct_right,
+            state.lct_parent,
+            state.occurrences,
+            state.occurrence_size,
+            state.frequency,
+            state.lazy_prefix,
+            state.lazy_size,
+            state.lazy_delta,
+            state.lct_stack,
+            state.last,
+            state.size,
+            state.edge_count,
+        )
+        for destination, source in zip(arrays, allocated, strict=True):
+            np.copyto(destination, source)
+        state.position = sequence_length
+    state.positions.fill(state.position)
+    return _candidate_step_from_arrays(state, arrays, device)
 
 
 def forward_candidates_step(state: CandidateState, tokens: Tensor) -> CandidateStep:

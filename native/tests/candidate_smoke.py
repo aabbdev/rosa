@@ -70,6 +70,61 @@ def compare(tokens: torch.Tensor, suffix_k: int, occurrences_r: int) -> None:
 def main() -> None:
     assert rosa_native_step.candidate_abi_version == 1
 
+    into_state = init_candidate_state(2, 3, suffix_k=2, occurrences_r=2)
+    into_native = rosa_native_step.NativeCandidateState(into_state)
+    into_arrays = (
+        np.empty((2, 4), dtype=np.int64),
+        np.empty((2, 4), dtype=np.int64),
+        np.empty((2, 4), dtype=np.int64),
+        np.empty((2, 4), dtype=np.int64),
+        np.empty(2, dtype=np.int32),
+    )
+    first_tokens = np.array([0, 3], dtype=np.int64)
+    into_native.step_into(first_tokens, *into_arrays)
+    allocating_state = init_candidate_state(2, 3, suffix_k=2, occurrences_r=2)
+    allocating_native = rosa_native_step.NativeCandidateState(allocating_state)
+    allocated = allocating_native.step(first_tokens)
+    assert all(
+        np.array_equal(actual, expected)
+        for actual, expected in zip(into_arrays, allocated, strict=True)
+    )
+    try:
+        overlap_state = rosa_native_step.NativeCandidateState(
+            init_candidate_state(2, 1, suffix_k=2, occurrences_r=2)
+        )
+        overlap_state.step_into(
+            first_tokens,
+            into_arrays[0],
+            into_arrays[0],
+            into_arrays[2],
+            into_arrays[3],
+            into_arrays[4],
+        )
+    except ValueError as error:
+        assert "overlap" in str(error)
+    else:
+        raise AssertionError("overlapping outputs were accepted")
+
+    prefix = np.array([[0, 1, 0], [3, 3, 4]], dtype=np.int64)
+    prefill_state = rosa_native_step.NativeCandidateState(
+        init_candidate_state(2, 3, suffix_k=2, occurrences_r=2)
+    )
+    prefill_arrays = (
+        np.empty((2, 3, 4), dtype=np.int64),
+        np.empty((2, 3, 4), dtype=np.int64),
+        np.empty((2, 3, 4), dtype=np.int64),
+        np.empty((2, 3, 4), dtype=np.int64),
+        np.empty((2, 3), dtype=np.int32),
+    )
+    prefill_state.prefill_into(prefix, *prefill_arrays)
+    prefill_allocating = rosa_native_step.NativeCandidateState(
+        init_candidate_state(2, 3, suffix_k=2, occurrences_r=2)
+    ).prefill(prefix)
+    assert all(
+        np.array_equal(actual, expected)
+        for actual, expected in zip(prefill_arrays, prefill_allocating, strict=True)
+    )
+
     # Pools are lazy, never useful below the prefill threshold, and invalid
     # thread limits (including signed strings) select the serial fallback.
     small_pool = rosa_native_step.NativeCandidateState(init_candidate_state(3, 4))

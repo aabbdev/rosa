@@ -5,11 +5,14 @@ import unittest
 from itertools import product
 from unittest.mock import patch
 
+import numpy as np
 import torch
 
 from rosa import (
     build_hard_candidates,
     forward_candidates_step,
+    forward_candidates_step_into,
+    init_candidate_buffers,
     init_candidate_state,
 )
 from rosa._stateful_candidates_numba import (
@@ -17,6 +20,7 @@ from rosa._stateful_candidates_numba import (
     CandidateStep,
     forward_candidates_step_masked,
     prefill_candidates,
+    prefill_candidates_into,
     reset_candidates_masked,
 )
 from rosa._stateful_candidates_numba import (
@@ -138,6 +142,57 @@ class TestStatefulCandidates(unittest.TestCase):
                     actual_tail, getattr(expected_full, field)[:, prefix.shape[1] :]
                 )
             )
+
+    def test_caller_owned_step_and_prefill_buffers_are_exact(self) -> None:
+        tokens = torch.tensor([[0, 1, 0, 2], [3, 3, 4, 3]])
+        state = init_candidate_state(2, 4, suffix_k=3, occurrences_r=2)
+        state.native_state = False
+        buffers = init_candidate_buffers(state)
+        retained = forward_candidates_step_into(state, tokens[:, 0], buffers)
+        retained_source = retained.source_index.clone()
+        current = forward_candidates_step_into(state, tokens[:, 1], buffers)
+        expected = build_hard_candidates(tokens[:, :2], suffix_k=3, occurrences_r=2)
+        for field in _FIELDS:
+            self.assertTrue(
+                torch.equal(getattr(current, field), getattr(expected, field)[:, 1]),
+                field,
+            )
+        self.assertFalse(torch.equal(retained.source_index, retained_source))
+
+        prefill_state = init_candidate_state(2, 4, suffix_k=3, occurrences_r=2)
+        prefill_state.native_state = False
+        prefill_buffers = init_candidate_buffers(prefill_state, sequence_length=4)
+        actual = prefill_candidates_into(prefill_state, tokens, prefill_buffers)
+        expected = build_hard_candidates(tokens, suffix_k=3, occurrences_r=2)
+        for field in _FIELDS:
+            self.assertTrue(
+                torch.equal(getattr(actual, field), getattr(expected, field))
+            )
+
+    def test_caller_owned_buffer_validation_and_allocating_snapshots(self) -> None:
+        state = init_candidate_state(1, 2, suffix_k=2, occurrences_r=2)
+        state.native_state = False
+        first = forward_candidates_step(state, torch.tensor([0]))
+        snapshot = first.source_index.clone()
+        forward_candidates_step(state, torch.tensor([0]))
+        self.assertTrue(torch.equal(first.source_index, snapshot))
+
+        wrong_state = init_candidate_state(1, 2, suffix_k=2, occurrences_r=2)
+        wrong_state.native_state = False
+        buffers = init_candidate_buffers(wrong_state)
+        buffers.source_index = np.empty((1, 3), dtype=np.int64)
+        with self.assertRaisesRegex(ValueError, "shape"):
+            forward_candidates_step_into(wrong_state, torch.tensor([0]), buffers)
+
+        buffers = init_candidate_buffers(wrong_state)
+        buffers.count.flags.writeable = False
+        with self.assertRaisesRegex(ValueError, "writable"):
+            forward_candidates_step_into(wrong_state, torch.tensor([0]), buffers)
+
+        with self.assertRaisesRegex(TypeError, "CandidateState"):
+            init_candidate_buffers(object())
+        with self.assertRaisesRegex(ValueError, "sequence_length"):
+            init_candidate_buffers(wrong_state, sequence_length=-1)
 
     def test_ragged_inactive_reset_capacity_and_recycle(self) -> None:
         state = init_candidate_state_internal(

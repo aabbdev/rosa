@@ -1060,26 +1060,35 @@ public:
   }
 
   py::tuple step(py::array tokens_object) {
-    if (ragged_mode_)
-      throw std::runtime_error("uniform step is unavailable on a ragged candidate state");
-    if (!py::isinstance<py::array_t<int64_t>>(tokens_object))
-      throw py::type_error("tokens must have dtype int64");
-    if ((tokens_object.flags() & py::array::c_style) == 0 ||
-        tokens_object.ndim() != 1 || tokens_object.shape(0) != batch_)
-      throw py::value_error("tokens must be contiguous int64 [batch_size]");
-    auto tokens = py::cast<py::array_t<int64_t, py::array::c_style>>(tokens_object);
     const int64_t slots = suffix_k_ * occurrences_r_;
     py::array_t<int64_t> source({batch_, slots}), match_length({batch_, slots}),
         state_id({batch_, slots}), candidate_frequency({batch_, slots});
     py::array_t<int32_t> count(batch_);
-    std::fill(source.mutable_data(), source.mutable_data() + batch_ * slots,
-              int64_t{-1});
-    std::fill(match_length.mutable_data(),
-              match_length.mutable_data() + batch_ * slots, int64_t{0});
-    std::fill(state_id.mutable_data(), state_id.mutable_data() + batch_ * slots,
-              int64_t{-1});
-    std::fill(candidate_frequency.mutable_data(),
-              candidate_frequency.mutable_data() + batch_ * slots, int64_t{0});
+    step_into(tokens_object, source, match_length, state_id,
+              candidate_frequency, count);
+    return py::make_tuple(source, match_length, state_id, candidate_frequency,
+                          count);
+  }
+
+  void step_into(py::array tokens_object, py::array source_object,
+                 py::array match_length_object, py::array state_id_object,
+                 py::array candidate_frequency_object,
+                 py::array count_object) {
+    if (ragged_mode_)
+      throw std::runtime_error("uniform step is unavailable on a ragged candidate state");
+    const int64_t slots = suffix_k_ * occurrences_r_;
+    auto tokens = checked_input<int64_t>(tokens_object, "tokens", {batch_});
+    auto source = checked_output<int64_t>(source_object, "source", {batch_, slots});
+    auto match_length = checked_output<int64_t>(
+        match_length_object, "length", {batch_, slots});
+    auto state_id = checked_output<int64_t>(state_id_object, "state", {batch_, slots});
+    auto candidate_frequency = checked_output<int64_t>(
+        candidate_frequency_object, "frequency", {batch_, slots});
+    auto count = checked_output<int32_t>(count_object, "count", {batch_});
+    validate_disjoint({tokens_object, source_object, match_length_object,
+                       state_id_object, candidate_frequency_object,
+                       count_object});
+    validate_runtime_positions();
     ensure_pool(64);
     std::unique_lock<std::mutex> call_lock;
     {
@@ -1087,6 +1096,14 @@ public:
       call_lock = std::unique_lock<std::mutex>(call_mutex_);
       if (position_ >= max_length_)
         throw std::runtime_error("candidate state capacity exceeded");
+      std::fill(source.mutable_data(), source.mutable_data() + batch_ * slots,
+              int64_t{-1});
+      std::fill(match_length.mutable_data(),
+              match_length.mutable_data() + batch_ * slots, int64_t{0});
+      std::fill(state_id.mutable_data(), state_id.mutable_data() + batch_ * slots,
+              int64_t{-1});
+      std::fill(candidate_frequency.mutable_data(),
+              candidate_frequency.mutable_data() + batch_ * slots, int64_t{0});
       parallel_for_rows(64, [&](int64_t b) {
         count.mutable_data()[b] =
             step_row(b, tokens.data()[b], position_,
@@ -1101,8 +1118,6 @@ public:
               position_);
     state_.attr("position") = py::int_(position_);
     call_lock.unlock();
-    return py::make_tuple(source, match_length, state_id, candidate_frequency,
-                          count);
   }
 
   void reset() {
@@ -1227,28 +1242,51 @@ public:
   }
 
   py::tuple prefill(py::array tokens_object) {
-    if (ragged_mode_)
-      throw std::runtime_error("prefill is unavailable on a ragged candidate state");
-    if (!py::isinstance<py::array_t<int64_t>>(tokens_object))
-      throw py::type_error("tokens must have dtype int64");
-    if ((tokens_object.flags() & py::array::c_style) == 0 ||
-        tokens_object.ndim() != 2 || tokens_object.shape(0) != batch_)
-      throw py::value_error(
-          "tokens must be contiguous int64 [batch_size, sequence_length]");
-    auto tokens = py::cast<py::array_t<int64_t, py::array::c_style>>(tokens_object);
-    const int64_t sequence_length = tokens.shape(1);
+    if (!py::isinstance<py::array_t<int64_t>>(tokens_object) ||
+        tokens_object.ndim() != 2)
+      throw py::type_error("tokens must be a two-dimensional int64 array");
+    const int64_t sequence_length = tokens_object.shape(1);
     const int64_t slots = suffix_k_ * occurrences_r_;
     py::array_t<int64_t> source({batch_, sequence_length, slots}),
         match_length({batch_, sequence_length, slots}),
         state_id({batch_, sequence_length, slots}),
         candidate_frequency({batch_, sequence_length, slots});
     py::array_t<int32_t> count({batch_, sequence_length});
+    prefill_into(tokens_object, source, match_length, state_id,
+                 candidate_frequency, count);
+    return py::make_tuple(source, match_length, state_id, candidate_frequency,
+                          count);
+  }
+
+  void prefill_into(py::array tokens_object, py::array source_object,
+                    py::array match_length_object, py::array state_id_object,
+                    py::array candidate_frequency_object,
+                    py::array count_object) {
+    if (ragged_mode_)
+      throw std::runtime_error("prefill is unavailable on a ragged candidate state");
+    if (!py::isinstance<py::array_t<int64_t>>(tokens_object) ||
+        tokens_object.ndim() != 2 || tokens_object.shape(0) != batch_)
+      throw py::value_error("tokens must be contiguous int64 [batch_size, sequence_length]");
+    const int64_t sequence_length = tokens_object.shape(1);
+    const int64_t slots = suffix_k_ * occurrences_r_;
+    auto tokens = checked_input<int64_t>(tokens_object, "tokens",
+                                         {batch_, sequence_length});
+    auto source = checked_output<int64_t>(
+        source_object, "source", {batch_, sequence_length, slots});
+    auto match_length = checked_output<int64_t>(
+        match_length_object, "length", {batch_, sequence_length, slots});
+    auto state_id = checked_output<int64_t>(
+        state_id_object, "state", {batch_, sequence_length, slots});
+    auto candidate_frequency = checked_output<int64_t>(
+        candidate_frequency_object, "frequency",
+        {batch_, sequence_length, slots});
+    auto count = checked_output<int32_t>(count_object, "count",
+                                         {batch_, sequence_length});
+    validate_disjoint({tokens_object, source_object, match_length_object,
+                       state_id_object, candidate_frequency_object,
+                       count_object});
+    validate_runtime_positions();
     const int64_t output_size = batch_ * sequence_length * slots;
-    std::fill(source.mutable_data(), source.mutable_data() + output_size, int64_t{-1});
-    std::fill(match_length.mutable_data(), match_length.mutable_data() + output_size, int64_t{0});
-    std::fill(state_id.mutable_data(), state_id.mutable_data() + output_size, int64_t{-1});
-    std::fill(candidate_frequency.mutable_data(), candidate_frequency.mutable_data() + output_size, int64_t{0});
-    std::fill(count.mutable_data(), count.mutable_data() + batch_ * sequence_length, int32_t{0});
     ensure_pool(4);
     std::unique_lock<std::mutex> call_lock;
     {
@@ -1258,6 +1296,11 @@ public:
         throw std::runtime_error("prefill requires an empty candidate state");
       if (sequence_length > max_length_)
         throw std::runtime_error("candidate state capacity exceeded");
+      std::fill(source.mutable_data(), source.mutable_data() + output_size, int64_t{-1});
+      std::fill(match_length.mutable_data(), match_length.mutable_data() + output_size, int64_t{0});
+      std::fill(state_id.mutable_data(), state_id.mutable_data() + output_size, int64_t{-1});
+      std::fill(candidate_frequency.mutable_data(), candidate_frequency.mutable_data() + output_size, int64_t{0});
+      std::fill(count.mutable_data(), count.mutable_data() + batch_ * sequence_length, int32_t{0});
       parallel_for_rows(4, [&](int64_t b) {
         for (int64_t position = 0; position < sequence_length; ++position) {
           const int64_t output_at = (b * sequence_length + position) * slots;
@@ -1275,8 +1318,6 @@ public:
               position_);
     state_.attr("position") = py::int_(position_);
     call_lock.unlock();
-    return py::make_tuple(source, match_length, state_id, candidate_frequency,
-                          count);
   }
 
   int64_t position() const { return position_; }
@@ -1286,6 +1327,69 @@ public:
   }
 
 private:
+  template <typename T>
+  py::array_t<T, py::array::c_style>
+  checked_input(py::array object, const char *name,
+                std::initializer_list<int64_t> shape) const {
+    if (!py::isinstance<py::array_t<T>>(object))
+      throw py::type_error(std::string(name) + " has an unexpected dtype");
+    if ((object.flags() & py::array::c_style) == 0 ||
+        object.ndim() != static_cast<int64_t>(shape.size()))
+      throw py::value_error(std::string(name) + " must be C-contiguous with the expected shape");
+    int64_t dimension = 0;
+    for (const int64_t extent : shape)
+      if (object.shape(dimension++) != extent)
+        throw py::value_error(std::string(name) + " must be C-contiguous with the expected shape");
+    return py::cast<py::array_t<T, py::array::c_style>>(object);
+  }
+
+  template <typename T>
+  py::array_t<T, py::array::c_style>
+  checked_output(py::array object, const char *name,
+                 std::initializer_list<int64_t> shape) const {
+    auto output = checked_input<T>(object, name, shape);
+    if (!output.writeable())
+      throw py::value_error(std::string(name) + " must be writable");
+    return output;
+  }
+
+  static bool overlaps(const py::array &first, const py::array &second) {
+    if (first.nbytes() == 0 || second.nbytes() == 0)
+      return false;
+    const auto first_begin = reinterpret_cast<uintptr_t>(first.data());
+    const auto second_begin = reinterpret_cast<uintptr_t>(second.data());
+    const auto first_end = first_begin + static_cast<uintptr_t>(first.nbytes());
+    const auto second_end = second_begin + static_cast<uintptr_t>(second.nbytes());
+    return first_begin < second_end && second_begin < first_end;
+  }
+
+  void validate_disjoint(std::initializer_list<py::array> call_arrays) const {
+    const std::vector<py::array> arrays(call_arrays);
+    for (size_t first = 0; first < arrays.size(); ++first)
+      for (size_t second = first + 1; second < arrays.size(); ++second)
+        if (overlaps(arrays[first], arrays[second]))
+          throw py::value_error("tokens and output buffers must not overlap");
+    const py::array state_arrays[] = {
+        history_, head_, edge_token_, edge_target_, edge_next_, hash_state_,
+        hash_token_, hash_edge_, suffix_link_, length_, left_, right_, parent_,
+        occurrences_, occurrence_size_, frequency_, lazy_prefix_, lazy_size_,
+        lazy_delta_, stack_, last_, size_, edge_count_, positions_};
+    for (const py::array &array : arrays)
+      for (const py::array &state_array : state_arrays)
+        if (overlaps(array, state_array))
+          throw py::value_error("tokens and output buffers must not overlap candidate state storage");
+  }
+
+  void validate_runtime_positions() const {
+    for (int64_t b = 0; b < batch_; ++b) {
+      const int64_t position = positions_.data()[b];
+      if (position < 0 || position > max_length_)
+        throw py::value_error("candidate positions are outside capacity");
+      if (!ragged_mode_ && position != position_)
+        throw py::value_error("uniform candidate positions are inconsistent");
+    }
+  }
+
   void ensure_pool(int64_t minimum_parallel_rows) {
     if (batch_ >= minimum_parallel_rows && !row_pool_)
       row_pool_ = std::make_unique<RowThreadPool>(batch_);
@@ -1656,6 +1760,7 @@ private:
   bool ragged_mode_ = false;
 };
 
+// Allocating candidate entry points delegate to their caller-owned variants.
 PYBIND11_MODULE(rosa_native_step, m) {
   m.doc() = "Exact CPU SAM+LCT step prototype (no libtorch calls in core)";
   py::class_<NativeState>(m, "NativeState")
@@ -1669,10 +1774,12 @@ PYBIND11_MODULE(rosa_native_step, m) {
   py::class_<NativeCandidateState>(m, "NativeCandidateState")
       .def(py::init<py::object>(), py::keep_alive<1, 2>())
       .def("step", &NativeCandidateState::step)
+      .def("step_into", &NativeCandidateState::step_into)
       .def("reset", &NativeCandidateState::reset)
       .def("step_masked", &NativeCandidateState::step_masked)
       .def("reset_masked", &NativeCandidateState::reset_masked)
       .def("prefill", &NativeCandidateState::prefill)
+      .def("prefill_into", &NativeCandidateState::prefill_into)
       .def_property_readonly("position", &NativeCandidateState::position)
       .def_property_readonly("positions", &NativeCandidateState::positions)
       .def_property_readonly("worker_count",

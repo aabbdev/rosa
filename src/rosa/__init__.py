@@ -33,8 +33,10 @@ __all__ = [
     "build_hard_candidates",
     "build_virtual_pool_indices",
     "forward_candidates_step",
+    "forward_candidates_step_into",
     "forward_step",
     "init_candidate_state",
+    "init_candidate_buffers",
     "init_inference_state",
     "prefill",
     "reference_rosa",
@@ -1244,6 +1246,14 @@ class ROSAInferenceState:
 
         return _inference_step(self, tokens, active=active, reset=reset)
 
+    def step_into(self, tokens: Tensor, buffers: object) -> InferenceOutput:
+        """Consume one rich uniform step into opt-in reusable buffers.
+
+        Candidate tensors in the result alias ``buffers`` until its next use.
+        """
+
+        return _inference_step_into(self, tokens, buffers)
+
     def prefill(self, tokens: Tensor) -> InferenceOutput:
         """Consume an initial dense context and return every step result."""
 
@@ -1351,6 +1361,18 @@ def init_candidate_state(
     )
 
 
+def init_candidate_buffers(state: object, *, sequence_length: int | None = None) -> Any:
+    """Allocate reusable packed CPU outputs for rich ``*_into`` calls."""
+
+    if isinstance(state, ROSAInferenceState):
+        if state.mode != "rich":
+            raise ValueError("candidate buffers require a rich state")
+        state = state._impl
+    from ._stateful_candidates_numba import init_candidate_buffers as initialize
+
+    return initialize(cast(Any, state), sequence_length=sequence_length)
+
+
 def forward_candidates_step(state: object, tokens: Tensor) -> Any:
     """Consume one token and return exact bounded hard candidates."""
 
@@ -1371,6 +1393,19 @@ def forward_candidates_step(state: object, tokens: Tensor) -> Any:
             ) from error
         raise  # pragma: no cover - unrelated optional import failure
     return step(cast(Any, state), tokens)
+
+
+def forward_candidates_step_into(state: object, tokens: Tensor, buffers: object) -> Any:
+    """Consume one rich step into explicitly reusable caller-owned buffers."""
+
+    if isinstance(state, ROSAInferenceState):
+        candidates = state.step_into(tokens, buffers).candidates
+        if candidates is None:  # pragma: no cover - guarded by step_into
+            raise RuntimeError("rich inference did not return candidates")
+        return candidates
+    from ._stateful_candidates_numba import forward_candidates_step_into as step
+
+    return step(cast(Any, state), tokens, cast(Any, buffers))
 
 
 def init_inference_state(
@@ -1536,6 +1571,26 @@ def _inference_step(
                     for name in candidate_data.__dataclass_fields__
                 )
             )
+    return InferenceOutput(output, candidates)
+
+
+def _inference_step_into(
+    state: ROSAInferenceState, token: Tensor, buffers: object
+) -> InferenceOutput:
+    if state.mode != "rich" or state.ragged:
+        raise ValueError("step_into requires a uniform rich inference state")
+    token, squeeze = _normalize_step_tokens(state, token)
+    from ._stateful_candidates_numba import forward_candidates_step_into as step
+
+    candidates = step(cast(Any, state._impl), token, cast(Any, buffers))
+    output = candidates.rosa_predicted_tokens
+    if squeeze:
+        output = output[0]
+        from ._stateful_candidates_numba import CandidateStep
+
+        candidates = CandidateStep(
+            *(getattr(candidates, name)[0] for name in candidates.__dataclass_fields__)
+        )
     return InferenceOutput(output, candidates)
 
 

@@ -164,6 +164,21 @@ the `numba` extra and automatically use compatible native companion methods
 when installed. Legacy `forward_step`, `prefill`, `init_candidate_state`, and
 `forward_candidates_step` remain supported.
 
+Latency-sensitive uniform rich inference can opt into caller-owned output
+storage and avoid the five native NumPy allocations on every token:
+
+```python
+from rosa import init_candidate_buffers
+
+rich = init_inference_state(8, 32_768, mode="rich")
+buffers = init_candidate_buffers(rich)
+result = rich.step_into(token_ids, buffers)
+```
+
+The returned candidate tensors alias `buffers` and are valid until those
+buffers are reused. The regular `step` API continues to return independently
+owned snapshots suitable for retention.
+
 ## Quick start
 
 ```python
