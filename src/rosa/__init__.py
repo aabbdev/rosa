@@ -25,6 +25,7 @@ __all__ = [
     "EXACT_KIND",
     "NULL_KIND",
     "ROSA",
+    "InferenceOutput",
     "ROSAInferenceState",
     "VIRTUAL_KIND",
     "HardCandidates",
@@ -1201,6 +1202,19 @@ class ROSA(nn.Module):
 
 
 InferenceBackend = Literal["auto", "python", "numba"]
+InferenceMode = Literal["top1", "rich"]
+
+
+@dataclass(frozen=True, slots=True)
+class InferenceOutput:
+    """Result returned by the unified inference-state methods.
+
+    ``candidates`` is ``None`` in top-1 mode, a ``CandidateStep`` for one
+    decoding step, and ``HardCandidates`` for a prefill in rich mode.
+    """
+
+    predicted_tokens: Tensor
+    candidates: object | None
 
 
 @dataclass(slots=True)
@@ -1214,13 +1228,46 @@ class ROSAInferenceState:
     batch_size: int
     max_length: int
     backend: Literal["python", "numba"]
+    mode: InferenceMode
+    ragged: bool
+    suffix_k: int
+    occurrences_r: int
     _impl: object = field(repr=False)
 
     @property
     def position(self) -> int:
         """Number of tokens consumed by every batch row."""
 
+        if self.ragged:
+            raise AttributeError(
+                "position is undefined for ragged states; use positions"
+            )
         return int(cast(Any, self._impl).position)
+
+    @property
+    def positions(self) -> Tensor:
+        """Consumed-token counts for every row, always returned as a copy."""
+
+        if self.ragged:
+            if self.mode == "top1":
+                return cast(Any, self._impl).positions.clone()
+            return torch.from_numpy(cast(Any, self._impl).positions.copy())
+        return torch.full((self.batch_size,), self.position, dtype=torch.long)
+
+    def step(
+        self,
+        tokens: Tensor,
+        active: Tensor | None = None,
+        reset: Tensor | None = None,
+    ) -> InferenceOutput:
+        """Consume one token per selected row using the configured mode."""
+
+        return _inference_step(self, tokens, active=active, reset=reset)
+
+    def prefill(self, tokens: Tensor) -> InferenceOutput:
+        """Consume an initial dense context and return every step result."""
+
+        return _inference_prefill(self, tokens)
 
     def reset(self) -> None:
         """Reset all batch rows while retaining the configured capacity."""
@@ -1229,6 +1276,10 @@ class ROSAInferenceState:
             self.batch_size,
             self.max_length,
             self.backend,
+            self.mode,
+            self.ragged,
+            self.suffix_k,
+            self.occurrences_r,
         )
 
 
@@ -1236,7 +1287,38 @@ def _make_inference_impl(
     batch_size: int,
     max_length: int,
     backend: Literal["python", "numba"],
+    mode: InferenceMode = "top1",
+    ragged: bool = False,
+    suffix_k: int = 16,
+    occurrences_r: int = 4,
 ) -> object:
+    if mode == "rich":
+        if backend != "numba":
+            raise ValueError(  # pragma: no cover - validated by public initializer
+                "rich inference requires backend='auto' or 'numba'"
+            )
+        if ragged:
+            return init_candidate_state(
+                batch_size,
+                max_length,
+                suffix_k=suffix_k,
+                occurrences_r=occurrences_r,
+                ragged=True,
+            )
+        return init_candidate_state(
+            batch_size,
+            max_length,
+            suffix_k=suffix_k,
+            occurrences_r=occurrences_r,
+        )
+    if ragged:
+        if backend != "numba":
+            raise ValueError(  # pragma: no cover - validated by public initializer
+                "ragged inference requires backend='auto' or 'numba'"
+            )
+        from .ragged import init_ragged_state
+
+        return init_ragged_state(batch_size, max_length)
     if backend == "python":
         return _init_python_inference_state(batch_size, max_length)
     try:
@@ -1256,6 +1338,7 @@ def init_candidate_state(
     *,
     suffix_k: int = 16,
     occurrences_r: int = 4,
+    ragged: bool = False,
 ) -> Any:
     """Allocate the exact bounded rich-candidate inference state.
 
@@ -1272,6 +1355,14 @@ def init_candidate_state(
                 "rich stateful candidates require the 'numba' extra"
             ) from error
         raise  # pragma: no cover - unrelated optional import failure
+    if ragged:
+        return initialize(
+            batch_size,
+            max_length,
+            suffix_k=suffix_k,
+            occurrences_r=occurrences_r,
+            ragged=True,
+        )
     return initialize(
         batch_size,
         max_length,
@@ -1282,6 +1373,14 @@ def init_candidate_state(
 
 def forward_candidates_step(state: object, tokens: Tensor) -> Any:
     """Consume one token and return exact bounded hard candidates."""
+
+    if isinstance(state, ROSAInferenceState):
+        if state.mode != "rich":
+            raise ValueError("forward_candidates_step requires a rich state")
+        candidates = state.step(tokens).candidates
+        if candidates is None:  # pragma: no cover - guarded by mode
+            raise RuntimeError("rich inference did not return candidates")
+        return candidates
 
     try:
         from ._stateful_candidates_numba import forward_candidates_step as step
@@ -1299,13 +1398,17 @@ def init_inference_state(
     max_length: int = 8192,
     *,
     backend: InferenceBackend = "auto",
+    mode: InferenceMode = "top1",
+    ragged: bool = False,
+    suffix_k: int = 16,
+    occurrences_r: int = 4,
 ) -> ROSAInferenceState:
-    """Create an explicit state for exact top-1 autoregressive ROSA inference.
+    """Create an exact top-1 or rich autoregressive ROSA inference state.
 
     ``backend="auto"`` selects the Link-Cut Tree Numba backend when the
     optional dependency is installed and otherwise uses the exact Python
-    fallback. Capacity is fixed so memory use and failure behavior remain
-    predictable in production.
+    fallback for uniform top-1 inference. Rich and ragged modes require the
+    Numba extra. Capacity is fixed so memory use remains predictable.
     """
 
     if batch_size <= 0:
@@ -1314,9 +1417,39 @@ def init_inference_state(
         raise ValueError("max_length must be > 0")
     if backend not in {"auto", "python", "numba"}:
         raise ValueError("backend must be 'auto', 'python', or 'numba'")
+    if mode not in {"top1", "rich"}:
+        raise ValueError("mode must be 'top1' or 'rich'")
+    if suffix_k <= 0:
+        raise ValueError("suffix_k must be > 0")
+    if occurrences_r <= 0:
+        raise ValueError("occurrences_r must be > 0")
+    if (mode == "rich" or ragged) and backend == "python":
+        feature = "rich" if mode == "rich" else "ragged"
+        raise ValueError(f"{feature} inference does not support backend='python'")
 
     selected: Literal["python", "numba"]
     if backend == "auto":
+        if mode == "rich" or ragged:
+            selected = "numba"
+            impl = _make_inference_impl(
+                batch_size,
+                max_length,
+                selected,
+                mode,
+                ragged,
+                suffix_k,
+                occurrences_r,
+            )
+            return ROSAInferenceState(
+                batch_size,
+                max_length,
+                selected,
+                mode,
+                ragged,
+                suffix_k,
+                occurrences_r,
+                impl,
+            )
         try:
             impl = _make_inference_impl(batch_size, max_length, "numba")
             selected = "numba"
@@ -1325,20 +1458,30 @@ def init_inference_state(
             selected = "python"
     else:
         selected = backend
-        impl = _make_inference_impl(batch_size, max_length, selected)
-    return ROSAInferenceState(batch_size, max_length, selected, impl)
+        impl = _make_inference_impl(
+            batch_size,
+            max_length,
+            selected,
+            mode,
+            ragged,
+            suffix_k,
+            occurrences_r,
+        )
+    return ROSAInferenceState(
+        batch_size,
+        max_length,
+        selected,
+        mode,
+        ragged,
+        suffix_k,
+        occurrences_r,
+        impl,
+    )
 
 
-def forward_step(state: ROSAInferenceState, token: Tensor) -> Tensor:
-    """Consume one token per batch row and return exact ROSA predictions.
-
-    ``token`` must be an integer tensor shaped ``[batch_size]``. A scalar is
-    also accepted when ``batch_size == 1`` and produces a scalar prediction.
-    The state remains on CPU; the prediction is returned on the token device.
-    """
-
-    if not isinstance(state, ROSAInferenceState):
-        raise TypeError("state must be a ROSAInferenceState")
+def _normalize_step_tokens(
+    state: ROSAInferenceState, token: Tensor
+) -> tuple[Tensor, bool]:
     if not isinstance(token, Tensor):
         raise TypeError("token must be a torch.Tensor")
     squeeze = token.ndim == 0
@@ -1354,25 +1497,113 @@ def forward_step(state: ROSAInferenceState, token: Tensor) -> Tensor:
         torch.int64,
     }:
         raise TypeError("token must use an integer dtype")
+    return token, squeeze
 
-    if state.backend == "python":
+
+def _rich_ragged_step(
+    state: ROSAInferenceState,
+    tokens: Tensor,
+    active: Tensor | None,
+    reset: Tensor | None,
+) -> Any:
+    from ._stateful_candidates_numba import forward_candidates_step_masked
+
+    active_mask = (
+        torch.ones(state.batch_size, dtype=torch.bool) if active is None else active
+    )
+    return forward_candidates_step_masked(
+        cast(Any, state._impl), tokens, active_mask, reset
+    )
+
+
+def _inference_step(
+    state: ROSAInferenceState,
+    token: Tensor,
+    *,
+    active: Tensor | None = None,
+    reset: Tensor | None = None,
+) -> InferenceOutput:
+    if not isinstance(state, ROSAInferenceState):  # pragma: no cover - method only
+        raise TypeError("state must be a ROSAInferenceState")
+    token, squeeze = _normalize_step_tokens(state, token)
+    if not state.ragged and (active is not None or reset is not None):
+        raise ValueError("active and reset are only valid for ragged states")
+
+    candidates: object | None = None
+    if state.mode == "rich":
+        if state.ragged:
+            candidates = _rich_ragged_step(state, token, active, reset)
+        else:
+            candidates = forward_candidates_step(state._impl, token)
+        output = cast(Any, candidates).rosa_predicted_tokens
+    elif state.ragged:
+        output = cast(Any, state._impl).step(token, active=active, reset=reset)
+    elif state.backend == "python":
         output = _python_forward_step(cast(_PythonInferenceState, state._impl), token)
     else:
         from ._stateful_numba import _forward_step
 
         output = _forward_step(cast(Any, state._impl), token)
-    return output[0] if squeeze else output
+    if squeeze:
+        output = output[0]
+        if candidates is not None:
+            from ._stateful_candidates_numba import CandidateStep
+
+            candidate_data = cast(Any, candidates)
+            candidates = CandidateStep(
+                *(
+                    getattr(candidate_data, name)[0]
+                    for name in candidate_data.__dataclass_fields__
+                )
+            )
+    return InferenceOutput(output, candidates)
 
 
-def prefill(state: ROSAInferenceState, tokens: Tensor) -> Tensor:
-    """Consume an initial context and return exact ROSA predictions.
+def forward_step(state: ROSAInferenceState, token: Tensor) -> Tensor:
+    """Consume one token per batch row and return exact ROSA predictions.
 
-    The state must be empty. ``tokens`` uses shape ``[batch_size, N]``; a
-    one-dimensional context is accepted when ``batch_size == 1``. The Numba
-    backend fuses the complete replay into one compiled call.
+    ``token`` must be an integer tensor shaped ``[batch_size]``. A scalar is
+    also accepted when ``batch_size == 1`` and produces a scalar prediction.
+    The state remains on CPU; the prediction is returned on the token device.
     """
 
     if not isinstance(state, ROSAInferenceState):
+        raise TypeError("state must be a ROSAInferenceState")
+    return state.step(token).predicted_tokens
+
+
+def _empty_rich_candidates(
+    state: ROSAInferenceState, device: torch.device
+) -> HardCandidates:
+    slots = state.suffix_k * state.occurrences_r
+    candidate_shape = (state.batch_size, 0, slots)
+    rosa_shape = (state.batch_size, 0)
+    source = torch.empty(candidate_shape, dtype=torch.long, device=device)
+    zeros = torch.empty(candidate_shape, dtype=torch.long, device=device)
+    return HardCandidates(
+        source,
+        zeros.clone(),
+        zeros.clone(),
+        zeros.clone(),
+        torch.empty(candidate_shape, dtype=torch.bool, device=device),
+        torch.empty(rosa_shape, dtype=torch.long, device=device),
+        torch.empty(rosa_shape, dtype=torch.long, device=device),
+        torch.empty(rosa_shape, dtype=torch.long, device=device),
+        torch.empty(rosa_shape, dtype=torch.long, device=device),
+    )
+
+
+def _stack_rich_steps(steps: list[Any], dim: int) -> HardCandidates:
+    return HardCandidates(
+        *(
+            torch.stack([getattr(step, name) for step in steps], dim=dim)
+            for name in HardCandidates.__dataclass_fields__
+        )
+    )
+
+
+def _inference_prefill(state: ROSAInferenceState, tokens: Tensor) -> InferenceOutput:
+    if not isinstance(state, ROSAInferenceState):  # pragma: no cover - method only
         raise TypeError("state must be a ROSAInferenceState")
     if not isinstance(tokens, Tensor):
         raise TypeError("tokens must be a torch.Tensor")
@@ -1389,12 +1620,13 @@ def prefill(state: ROSAInferenceState, tokens: Tensor) -> Tensor:
         torch.int64,
     }:
         raise TypeError("tokens must use an integer dtype")
-    if state.position != 0:
+    if bool(torch.any(state.positions != 0)):
         raise RuntimeError("prefill requires an empty inference state")
     if tokens.shape[1] > state.max_length:
         raise RuntimeError("inference state capacity exceeded")
 
-    if state.backend == "python":
+    candidates: HardCandidates | None = None
+    if state.mode == "top1" and not state.ragged and state.backend == "python":
         backend_state = cast(_PythonInferenceState, state._impl)
         if tokens.shape[1] == 0:
             output = torch.empty(tokens.shape, dtype=torch.long, device=tokens.device)
@@ -1406,8 +1638,54 @@ def prefill(state: ROSAInferenceState, tokens: Tensor) -> Tensor:
                 ],
                 dim=1,
             )
-    else:
+    elif state.mode == "top1" and not state.ragged:
         from ._stateful_numba import _prefill
 
         output = _prefill(cast(Any, state._impl), tokens)
-    return output[0] if squeeze else output
+    elif state.mode == "rich" and not state.ragged:
+        from ._stateful_candidates_numba import prefill_candidates
+
+        rich_output = prefill_candidates(cast(Any, state._impl), tokens)
+        output = rich_output.rosa_predicted_tokens
+        candidates = HardCandidates(
+            *(
+                getattr(rich_output, name)
+                for name in HardCandidates.__dataclass_fields__
+            )
+        )
+    elif tokens.shape[1] == 0:
+        output = torch.empty(tokens.shape, dtype=torch.long, device=tokens.device)
+        if state.mode == "rich":
+            candidates = _empty_rich_candidates(state, tokens.device)
+    else:
+        step_outputs = [
+            state.step(tokens[:, position]) for position in range(tokens.shape[1])
+        ]
+        output = torch.stack([item.predicted_tokens for item in step_outputs], dim=1)
+        if state.mode == "rich":
+            candidates = _stack_rich_steps(
+                [cast(Any, item.candidates) for item in step_outputs], 1
+            )
+    if squeeze:
+        output = output[0]
+        if candidates is not None:
+            candidates = HardCandidates(
+                *(
+                    getattr(candidates, name)[0]
+                    for name in candidates.__dataclass_fields__
+                )
+            )
+    return InferenceOutput(output, candidates)
+
+
+def prefill(state: ROSAInferenceState, tokens: Tensor) -> Tensor:
+    """Consume an initial context and return exact ROSA predictions.
+
+    The state must be empty. ``tokens`` uses shape ``[batch_size, N]``; a
+    one-dimensional context is accepted when ``batch_size == 1``. The Numba
+    backend fuses the complete replay into one compiled call.
+    """
+
+    if not isinstance(state, ROSAInferenceState):
+        raise TypeError("state must be a ROSAInferenceState")
+    return state.prefill(tokens).predicted_tokens
