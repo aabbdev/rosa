@@ -1,5 +1,9 @@
 # ROSA as Differentiable Sparse Retrieval with an Exact Suffix Automaton
 
+[![PyPI](https://img.shields.io/pypi/v/rosa-torch.svg)](https://pypi.org/project/rosa-torch/)
+[![Python](https://img.shields.io/pypi/pyversions/rosa-torch.svg)](https://pypi.org/project/rosa-torch/)
+[![CI](https://github.com/aabbdev/rosa/actions/workflows/ci.yml/badge.svg)](https://github.com/aabbdev/rosa/actions/workflows/ci.yml)
+
 This repository is an independent PyTorch implementation and differentiable
 extension of **RWKV-8 ROSA (Rapid Online Suffix Automaton)**, described by
 [Bo Peng (BlinkDL)](https://github.com/BlinkDL) in
@@ -27,7 +31,31 @@ The design avoids a trainable dense automaton transition tensor and avoids dense
 - Learned read gate before the retrieved value is added to the target stream.
 - Exact ROSA prior plus a learned residual candidate score.
 - Auxiliary losses for ROSA distillation, hard/soft consistency, codebook balance, and virtual-candidate usage.
+- Unified exact `top1`/`rich`, uniform/ragged stateful inference facade.
+- Rooted Link-Cut Tree updates with fused full-context prefill.
+- Optional C++ companion with parallel batch prefill and reusable output buffers.
+- Candidate-wise projections eliminated from the differentiable tensor path.
+- Optional shape-specialized `torch.compile` soft-match acceleration.
 - 100% statement and branch coverage for the `rosa` package.
+
+## What's new in 0.2.0
+
+Version 0.2.0 turns the original differentiable prototype into a unified
+training and inference package:
+
+- exact stateful inference now scales with amortized `O(log N)` suffix-path
+  updates instead of eager linear propagation;
+- one facade covers top-1 and rich candidates, dense and ragged batches,
+  prefill, continuation, reset, and row recycling;
+- the optional native companion accelerates rich/top-1 prefill, parallel batch
+  work, and caller-owned `step_into` buffers while retaining exact fallbacks;
+- `ROSA.forward` uses fused rich candidate prefill and preserves the independent
+  Python oracle;
+- projections are performed before candidate gather, and an opt-in compiled
+  soft-match island accelerates warmed fixed-shape training workloads.
+
+See the [changelog](https://github.com/aabbdev/rosa/blob/v0.2.0/CHANGELOG.md)
+for compatibility notes and the complete release summary.
 
 ## Core scoring rule
 
@@ -60,12 +88,19 @@ Install the stateful Link-Cut Tree backend with:
 uv add 'rosa-torch[numba]'
 ```
 
-For the lowest CPU step latency, install a locally built native companion wheel
-(or a published wheel once multi-ABI releases are enabled):
+For the lowest CPU step latency, build and install the optional native companion
+locally. `rosa-torch-native` is not currently published on PyPI because it
+requires per-platform and per-Python ABI wheels:
 
 ```bash
+git clone https://github.com/aabbdev/rosa.git
+cd rosa
+uv build --wheel native --out-dir native/dist
 uv pip install native/dist/rosa_torch_native-0.2.0-*.whl
 ```
+
+The native sources are available from the Git repository and are not included
+in the pure-Python `rosa-torch` source distribution on PyPI.
 
 The stateful backend detects it lazily and otherwise falls back to Numba.
 
@@ -87,6 +122,11 @@ PEP 517-compatible Python package manager.
 .
 ├── pyproject.toml
 ├── README.md
+├── CHANGELOG.md
+├── native
+│   ├── pyproject.toml
+│   ├── src/rosa_native_step.cpp
+│   └── tests
 ├── src
 │   └── rosa
 │       ├── __init__.py
@@ -99,6 +139,7 @@ PEP 517-compatible Python package manager.
     ├── run_coverage.py
     ├── test_inference.py
     ├── test_numba_backend.py
+    ├── test_ragged.py
     └── test_rosa.py
 ```
 
@@ -216,6 +257,20 @@ print(out.updated.shape)  # [B, N, D]
 print(out.chosen_source_index.shape)  # [B, N]
 print(out.hard_rosa_match_length.shape)  # [B, N]
 ```
+
+ROSA uses the eager bounded differentiable `_soft_match` implementation by
+default. Set `compile_soft_match=True` to opt into a static `torch.compile`
+island, then warm every expected device, dtype, and shape bucket before serving:
+
+```python
+compiled_rosa = ROSA(d_model=64, compile_soft_match=True)
+# Run representative forward and backward calls during application warm-up.
+```
+
+The compiled path reuses one callable per verification window. A compilation
+or execution failure during the forward falls back to eager only for that input
+signature; other devices and shapes remain eligible for compilation. Deferred
+AOTAutograd errors raised during backward are propagated rather than retried.
 
 `z_a` is used to derive the internal symbolic stream and retrieval decisions. `z_b` is the stream receiving the gated retrieval residual. If `z_b` is omitted, `z_a` is used as the target stream as well.
 

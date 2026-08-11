@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import copy
 import random
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 import torch
@@ -15,7 +17,11 @@ from rosa import (
     VIRTUAL_KIND,
     _balance_kl,
     _build_forward_hard_candidates,
+    _clear_soft_match_compile_cache,
     _gather_sequence,
+    _soft_match,
+    _soft_match_signature,
+    _soft_match_torch,
     _st_categorical,
     _virtual_pool_single,
     build_hard_candidates,
@@ -54,6 +60,36 @@ def zero_learned_scorer(model: ROSA) -> None:
         model.kind_bias.zero_()
         model.null_head.weight.zero_()
         model.null_head.bias.zero_()
+
+
+class _GatherFirstROSA(ROSA):
+    """Local pre-fusion oracle retaining candidate-first projection order."""
+
+    def _virtual_pool_keys(self, z_a: torch.Tensor, pool: torch.Tensor) -> torch.Tensor:
+        return self.virtual_key(_gather_sequence(z_a, pool))
+
+    def _candidate_selector_keys(
+        self, z_a: torch.Tensor, source: torch.Tensor
+    ) -> torch.Tensor:
+        return self.selector_key(_gather_sequence(z_a, source))
+
+    def _candidate_symbolic_values(
+        self,
+        st1: torch.Tensor,
+        st2: torch.Tensor,
+        next_position: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        g1 = _gather_sequence(st1, next_position)
+        g2 = _gather_sequence(st2, next_position)
+        e1 = g1 @ self.symbol_embedding_1.weight
+        e2 = g2 @ self.symbol_embedding_2.weight
+        return (e1 + e2) * mask.unsqueeze(-1).to(e1.dtype)
+
+    def _candidate_neural_values(
+        self, z_a: torch.Tensor, next_position: torch.Tensor
+    ) -> torch.Tensor:
+        return self.value_proj(_gather_sequence(z_a, next_position))
 
 
 class TestReferenceROSA(unittest.TestCase):
@@ -165,6 +201,261 @@ class TestHelpers(unittest.TestCase):
         self.assertAlmostEqual(float(_balance_kl(uniform)), 0.0, places=6)
         self.assertGreater(float(_balance_kl(peaked)), 1.0)
 
+    def test_compiled_soft_match_matches_eager_across_specializations(self) -> None:
+        devices = [torch.device("cpu")]
+        if torch.cuda.is_available():
+            devices.append(torch.device("cuda"))
+
+        for device in devices:
+            with self.subTest(device=device.type):
+                _clear_soft_match_compile_cache()
+                cached_callable = None
+                for shape in ((2, 7, 5), (1, 11, 3)):
+                    batch, length, candidates = shape
+                    torch.manual_seed(20260811 + length)
+                    actual_st1 = torch.softmax(
+                        torch.randn(batch, length, 4, device=device), dim=-1
+                    ).requires_grad_()
+                    actual_st2 = torch.softmax(
+                        torch.randn(batch, length, 3, device=device), dim=-1
+                    ).requires_grad_()
+                    expected_st1 = actual_st1.detach().clone().requires_grad_()
+                    expected_st2 = actual_st2.detach().clone().requires_grad_()
+                    source = torch.randint(
+                        -1, length, (batch, length, candidates), device=device
+                    )
+                    mask = torch.rand(batch, length, candidates, device=device) > 0.2
+
+                    actual = _soft_match(actual_st1, actual_st2, source, mask, window=4)
+                    expected = _soft_match_torch(
+                        expected_st1, expected_st2, source, mask, window=4
+                    )
+                    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+                    actual.square().sum().backward()
+                    expected.square().sum().backward()
+                    assert actual_st1.grad is not None
+                    assert actual_st2.grad is not None
+                    assert expected_st1.grad is not None
+                    assert expected_st2.grad is not None
+                    torch.testing.assert_close(
+                        actual_st1.grad, expected_st1.grad, rtol=2e-5, atol=2e-6
+                    )
+                    torch.testing.assert_close(
+                        actual_st2.grad, expected_st2.grad, rtol=2e-5, atol=2e-6
+                    )
+
+                    signature = _soft_match_signature(
+                        actual_st1, actual_st2, source, mask, 4
+                    )
+                    if signature not in rosa._SOFT_MATCH_COMPILE_FAILURES:
+                        self.assertEqual(len(rosa._SOFT_MATCH_COMPILED), 1)
+                        self.assertIn(signature, rosa._SOFT_MATCH_COMPILE_READY)
+                        if cached_callable is None:
+                            cached_callable = rosa._SOFT_MATCH_COMPILED[4]
+                        else:
+                            self.assertIs(cached_callable, rosa._SOFT_MATCH_COMPILED[4])
+
+    def test_soft_match_compile_failure_falls_back_before_caching(self) -> None:
+        _clear_soft_match_compile_cache()
+        st1 = torch.softmax(torch.randn(1, 5, 3), dim=-1)
+        st2 = torch.softmax(torch.randn(1, 5, 2), dim=-1)
+        source = torch.randint(-1, 5, (1, 5, 4))
+        mask = source >= 0
+        expected = _soft_match_torch(st1, st2, source, mask, window=3)
+        with patch("rosa.torch.compile", side_effect=RuntimeError("unavailable")):
+            actual = _soft_match(st1, st2, source, mask, window=3)
+        signature = _soft_match_signature(st1, st2, source, mask, 3)
+        self.assertTrue(torch.equal(actual, expected))
+        self.assertNotIn(3, rosa._SOFT_MATCH_COMPILED)
+        self.assertIn(signature, rosa._SOFT_MATCH_COMPILE_FAILURES)
+        _clear_soft_match_compile_cache()
+
+    def test_soft_match_disabled_and_ready_failure_fall_back(self) -> None:
+        _clear_soft_match_compile_cache()
+        st1 = torch.softmax(torch.randn(1, 5, 3), dim=-1)
+        st2 = torch.softmax(torch.randn(1, 5, 2), dim=-1)
+        source = torch.randint(-1, 5, (1, 5, 4))
+        mask = source >= 0
+        expected = _soft_match_torch(st1, st2, source, mask, window=3)
+        with patch("rosa._SOFT_MATCH_COMPILE_ENABLED", False):
+            disabled = _soft_match(st1, st2, source, mask, window=3)
+        self.assertTrue(torch.equal(disabled, expected))
+
+        signature = _soft_match_signature(st1, st2, source, mask, 3)
+
+        def fail(*args: torch.Tensor) -> torch.Tensor:
+            raise RuntimeError("cached specialization failed")
+
+        rosa._SOFT_MATCH_COMPILED[3] = fail
+        rosa._SOFT_MATCH_COMPILE_READY.add(signature)
+        actual = _soft_match(st1, st2, source, mask, window=3)
+        self.assertTrue(torch.equal(actual, expected))
+        self.assertIn(signature, rosa._SOFT_MATCH_COMPILE_FAILURES)
+        _clear_soft_match_compile_cache()
+
+    def test_soft_match_compile_initialization_is_thread_safe(self) -> None:
+        _clear_soft_match_compile_cache()
+        st1 = torch.softmax(torch.randn(1, 5, 3), dim=-1)
+        st2 = torch.softmax(torch.randn(1, 5, 2), dim=-1)
+        source = torch.randint(-1, 5, (1, 5, 4))
+        mask = source >= 0
+        start = threading.Barrier(2)
+        compile_calls = 0
+        forward_calls = 0
+        calls_lock = threading.Lock()
+
+        def compiled(*args: torch.Tensor) -> torch.Tensor:
+            nonlocal forward_calls
+            with calls_lock:
+                forward_calls += 1
+            return _soft_match_torch(*args, window=3)
+
+        def compile_once(*args: object, **kwargs: object) -> object:
+            nonlocal compile_calls
+            with calls_lock:
+                compile_calls += 1
+            return compiled
+
+        def invoke() -> torch.Tensor:
+            start.wait()
+            return _soft_match(st1, st2, source, mask, window=3)
+
+        with (
+            patch("rosa.torch.compile", side_effect=compile_once),
+            ThreadPoolExecutor(max_workers=2) as executor,
+        ):
+            results = [
+                future.result()
+                for future in (executor.submit(invoke), executor.submit(invoke))
+            ]
+
+        self.assertEqual(compile_calls, 1)
+        self.assertEqual(forward_calls, 2)
+        self.assertTrue(torch.equal(results[0], results[1]))
+        signature = _soft_match_signature(st1, st2, source, mask, 3)
+        self.assertIn(signature, rosa._SOFT_MATCH_COMPILE_READY)
+
+    def test_soft_match_failure_does_not_poison_other_signature(self) -> None:
+        _clear_soft_match_compile_cache()
+        calls: list[tuple[int, ...]] = []
+
+        def compiled(
+            st1: torch.Tensor,
+            st2: torch.Tensor,
+            source: torch.Tensor,
+            mask: torch.Tensor,
+        ) -> torch.Tensor:
+            calls.append(tuple(source.shape))
+            if source.shape[1] == 5:
+                raise RuntimeError("unsupported shape")
+            return _soft_match_torch(st1, st2, source, mask, window=3)
+
+        def inputs(length: int) -> tuple[torch.Tensor, ...]:
+            st1 = torch.softmax(torch.randn(1, length, 3), dim=-1)
+            st2 = torch.softmax(torch.randn(1, length, 2), dim=-1)
+            source = torch.randint(-1, length, (1, length, 4))
+            return st1, st2, source, source >= 0
+
+        failing = inputs(5)
+        working = inputs(7)
+        with patch("rosa.torch.compile", return_value=compiled) as compile_mock:
+            failed_result = _soft_match(*failing, window=3)
+            working_result = _soft_match(*working, window=3)
+            retried_result = _soft_match(*failing, window=3)
+
+        self.assertEqual(compile_mock.call_count, 1)
+        self.assertEqual(calls, [(1, 5, 4), (1, 7, 4)])
+        self.assertTrue(
+            torch.equal(failed_result, _soft_match_torch(*failing, window=3))
+        )
+        self.assertTrue(
+            torch.equal(retried_result, _soft_match_torch(*failing, window=3))
+        )
+        self.assertTrue(
+            torch.equal(working_result, _soft_match_torch(*working, window=3))
+        )
+        self.assertIn(3, rosa._SOFT_MATCH_COMPILED)
+        self.assertIn(
+            _soft_match_signature(*failing, window=3),
+            rosa._SOFT_MATCH_COMPILE_FAILURES,
+        )
+        self.assertIn(
+            _soft_match_signature(*working, window=3),
+            rosa._SOFT_MATCH_COMPILE_READY,
+        )
+
+    def test_soft_match_signature_distinguishes_device(self) -> None:
+        cpu = torch.empty(1, 2, 3)
+        cpu_source = torch.empty(1, 2, 4, dtype=torch.long)
+        meta = torch.empty(1, 2, 3, device="meta")
+        meta_source = torch.empty(1, 2, 4, dtype=torch.long, device="meta")
+        cpu_signature = _soft_match_signature(cpu, cpu, cpu_source, cpu_source >= 0, 3)
+        meta_signature = _soft_match_signature(
+            meta, meta, meta_source, meta_source >= 0, 3
+        )
+        self.assertNotEqual(cpu_signature, meta_signature)
+
+    def test_soft_match_signature_distinguishes_layout_and_grad_mode(self) -> None:
+        st1 = torch.randn(1, 5, 3, requires_grad=True)
+        st2 = torch.randn(1, 5, 2, requires_grad=True)
+        source = torch.zeros(1, 5, 4, dtype=torch.long)
+        mask = torch.ones_like(source, dtype=torch.bool)
+        baseline = _soft_match_signature(st1, st2, source, mask, 3)
+        noncontiguous_st2 = torch.randn(1, 2, 5).transpose(1, 2).requires_grad_()
+        self.assertNotEqual(
+            baseline,
+            _soft_match_signature(st1, noncontiguous_st2, source, mask, 3),
+        )
+        self.assertNotEqual(
+            baseline,
+            _soft_match_signature(st1.detach(), st2, source, mask, 3),
+        )
+        with torch.no_grad():
+            no_grad = _soft_match_signature(st1, st2, source, mask, 3)
+        self.assertNotEqual(baseline, no_grad)
+        with torch.inference_mode():
+            inference = _soft_match_signature(st1, st2, source, mask, 3)
+        self.assertNotEqual(no_grad, inference)
+
+    def test_soft_match_backward_compile_error_is_propagated(self) -> None:
+        _clear_soft_match_compile_cache()
+        st1 = torch.randn(1, 3, 2, requires_grad=True)
+        st2 = torch.randn(1, 3, 2, requires_grad=True)
+        source = torch.zeros(1, 3, 1, dtype=torch.long)
+        mask = torch.ones_like(source, dtype=torch.bool)
+
+        class BackwardFailure(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx: object, value: torch.Tensor) -> torch.Tensor:
+                return value.sum()
+
+            @staticmethod
+            def backward(ctx: object, grad: torch.Tensor) -> torch.Tensor:
+                raise RuntimeError("deferred AOT backward failure")
+
+        def compiled(*args: torch.Tensor) -> torch.Tensor:
+            return BackwardFailure.apply(args[0])
+
+        with patch("rosa.torch.compile", return_value=compiled):
+            result = _soft_match(st1, st2, source, mask, window=2)
+
+        with self.assertRaisesRegex(RuntimeError, "deferred AOT backward failure"):
+            result.backward()
+
+    def test_rosa_soft_match_is_eager_by_default(self) -> None:
+        model = ROSA(d_model=4, soft_verify_window=2)
+        st1 = torch.softmax(torch.randn(1, 4, 3), dim=-1)
+        st2 = torch.softmax(torch.randn(1, 4, 2), dim=-1)
+        source = torch.randint(-1, 4, (1, 4, 2))
+        mask = source >= 0
+        expected = _soft_match_torch(st1, st2, source, mask, window=2)
+
+        with patch("rosa.torch.compile") as compile_mock:
+            actual = model._soft_match(st1, st2, source, mask)
+
+        compile_mock.assert_not_called()
+        self.assertTrue(torch.equal(actual, expected))
+
 
 class TestROSAConfiguration(unittest.TestCase):
     def test_constructor_validations(self) -> None:
@@ -209,6 +500,8 @@ class TestROSAConfiguration(unittest.TestCase):
                 ROSA(**kwargs)
         with self.assertRaisesRegex(TypeError, "soft_candidates_forward"):
             ROSA(d_model=4, soft_candidates_forward=1)  # type: ignore[arg-type]
+        with self.assertRaisesRegex(TypeError, "compile_soft_match"):
+            ROSA(d_model=4, compile_soft_match=1)  # type: ignore[arg-type]
 
     def test_setters_property_and_encode_validation(self) -> None:
         model = ROSA(
@@ -222,6 +515,24 @@ class TestROSAConfiguration(unittest.TestCase):
             selector_dim=5,
         )
         self.assertEqual(model.vocab_size, 6)
+        self.assertFalse(model.compile_soft_match)
+        self.assertTrue(ROSA(d_model=4, compile_soft_match=True).compile_soft_match)
+        positional = ROSA(
+            4,
+            (2, 2),
+            2,
+            2,
+            3,
+            2,
+            4,
+            0,
+            0,
+            4,
+            False,
+            5,
+        )
+        self.assertEqual(positional.selector_dim, 5)
+        self.assertFalse(positional.compile_soft_match)
         model.set_learned_residual_scale(0.4)
         model.set_virtual_scale(0.5)
         model.set_neural_value_scale(0.6)
@@ -347,6 +658,175 @@ class TestROSASemantics(unittest.TestCase):
             if actual.grad is not None:
                 assert expected.grad is not None
                 self.assertTrue(torch.equal(actual.grad, expected.grad), actual_name)
+
+    def test_project_before_gather_matches_gather_first_oracle(self) -> None:
+        # Moving a linear projection across a gather changes GEMM row batching,
+        # so FP32 accumulation may differ slightly. These tolerances cover that
+        # expected roundoff while remaining tight enough to catch path changes.
+        devices = [torch.device("cpu")]
+        if torch.cuda.is_available():
+            devices.append(torch.device("cuda"))
+
+        for device in devices:
+            with self.subTest(device=device.type):
+                torch.manual_seed(20260811)
+                optimized = self.make_model(
+                    dense_recent_candidates=3,
+                    sparse_old_candidates=2,
+                    sparse_old_pool_size=5,
+                    learned_residual_scale=1.0,
+                    virtual_scale=1.0,
+                    neural_value_scale=1.0,
+                    read_gate_bias=0.0,
+                    value_gate_bias=0.0,
+                    candidate_backend="python",
+                    compile_soft_match=False,
+                ).to(device)
+                oracle = _GatherFirstROSA(
+                    d_model=8,
+                    codebook_sizes=(2, 3),
+                    suffix_k=5,
+                    occurrences_r=3,
+                    soft_verify_window=6,
+                    virtual_candidates=2,
+                    virtual_pool_size=6,
+                    dense_recent_candidates=3,
+                    sparse_old_candidates=2,
+                    sparse_old_pool_size=5,
+                    selector_dim=8,
+                    token_temperature=0.2,
+                    retrieval_temperature=0.7,
+                    learned_residual_scale=1.0,
+                    virtual_scale=1.0,
+                    neural_value_scale=1.0,
+                    read_gate_bias=0.0,
+                    value_gate_bias=0.0,
+                    candidate_backend="python",
+                    compile_soft_match=False,
+                ).to(device)
+                oracle.load_state_dict(optimized.state_dict())
+
+                z_optimized = torch.randn(2, 13, 8, device=device, requires_grad=True)
+                z_oracle = z_optimized.detach().clone().requires_grad_()
+                target = torch.randn_like(z_optimized)
+                logits_optimized = tuple(
+                    torch.randn(2, 13, size, device=device, requires_grad=True)
+                    for size in (2, 3)
+                )
+                logits_oracle = tuple(
+                    item.detach().clone().requires_grad_() for item in logits_optimized
+                )
+
+                actual = optimized(z_optimized, code_logits=logits_optimized)
+                expected = oracle(z_oracle, code_logits=logits_oracle)
+                exact_fields = (
+                    "hard_tokens",
+                    "candidate_source_index",
+                    "candidate_kind",
+                    "candidate_mask",
+                    "chosen_candidate",
+                    "chosen_source_index",
+                    "chosen_token",
+                    "chosen_match_length",
+                    "chosen_is_virtual",
+                    "hard_rosa_source_index",
+                    "hard_rosa_predicted_tokens",
+                    "hard_rosa_match_length",
+                )
+                for name in exact_fields:
+                    self.assertTrue(
+                        torch.equal(getattr(actual, name), getattr(expected, name)),
+                        name,
+                    )
+
+                rtol, atol = (1e-4, 2e-5) if device.type == "cuda" else (3e-5, 3e-6)
+
+                def assert_close_nested(
+                    actual_value, expected_value, name: str
+                ) -> None:
+                    if isinstance(actual_value, torch.Tensor):
+                        if actual_value.is_floating_point():
+                            torch.testing.assert_close(
+                                actual_value,
+                                expected_value,
+                                rtol=rtol,
+                                atol=atol,
+                                msg=name,
+                            )
+                        else:
+                            self.assertTrue(
+                                torch.equal(actual_value, expected_value), name
+                            )
+                    elif isinstance(actual_value, tuple):
+                        for index, (actual_item, expected_item) in enumerate(
+                            zip(actual_value, expected_value, strict=True)
+                        ):
+                            assert_close_nested(
+                                actual_item, expected_item, f"{name}[{index}]"
+                            )
+                    elif isinstance(actual_value, dict):
+                        self.assertEqual(actual_value.keys(), expected_value.keys())
+                        for key in actual_value:
+                            assert_close_nested(
+                                actual_value[key], expected_value[key], f"{name}.{key}"
+                            )
+                    else:
+                        self.assertEqual(actual_value, expected_value, name)
+
+                for name in actual.__dataclass_fields__:
+                    assert_close_nested(
+                        getattr(actual, name), getattr(expected, name), name
+                    )
+
+                actual_loss = F.mse_loss(actual.updated, target) + sum(
+                    actual.aux_losses.values()
+                )
+                expected_loss = F.mse_loss(expected.updated, target) + sum(
+                    expected.aux_losses.values()
+                )
+                torch.testing.assert_close(
+                    actual_loss, expected_loss, rtol=rtol, atol=atol
+                )
+                actual_loss.backward()
+                expected_loss.backward()
+
+                assert z_optimized.grad is not None
+                assert z_oracle.grad is not None
+                torch.testing.assert_close(
+                    z_optimized.grad, z_oracle.grad, rtol=rtol, atol=atol
+                )
+                for actual_logits, expected_logits in zip(
+                    logits_optimized, logits_oracle, strict=True
+                ):
+                    assert actual_logits.grad is not None
+                    assert expected_logits.grad is not None
+                    torch.testing.assert_close(
+                        actual_logits.grad,
+                        expected_logits.grad,
+                        rtol=rtol,
+                        atol=atol,
+                    )
+                for (actual_name, actual_parameter), (
+                    expected_name,
+                    expected_parameter,
+                ) in zip(
+                    optimized.named_parameters(), oracle.named_parameters(), strict=True
+                ):
+                    self.assertEqual(actual_name, expected_name)
+                    self.assertEqual(
+                        actual_parameter.grad is None,
+                        expected_parameter.grad is None,
+                        actual_name,
+                    )
+                    if actual_parameter.grad is not None:
+                        assert expected_parameter.grad is not None
+                        torch.testing.assert_close(
+                            actual_parameter.grad,
+                            expected_parameter.grad,
+                            rtol=rtol,
+                            atol=atol,
+                            msg=actual_name,
+                        )
 
     def test_stateful_forward_does_not_call_eager_or_suffix_write(self) -> None:
         from rosa._stateful_candidates_numba import prefill_candidates

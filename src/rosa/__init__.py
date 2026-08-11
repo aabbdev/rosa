@@ -9,6 +9,7 @@ well-defined while allowing end-to-end gradient-based training.
 from __future__ import annotations
 
 import math
+import threading
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast
@@ -512,6 +513,205 @@ def _gather_sequence(x: Tensor, index: Tensor) -> Tensor:
     return x[batch, safe]
 
 
+def _soft_match_torch(
+    st1: Tensor,
+    st2: Tensor,
+    source_index: Tensor,
+    candidate_mask: Tensor,
+    window: int,
+) -> Tensor:
+    """Pure-Torch soft suffix verification with a statically bounded window."""
+
+    bsz, n, candidates = source_index.shape
+    positions = torch.arange(n, device=source_index.device).view(1, n, 1)
+    positions = positions.expand(bsz, n, candidates)
+    survival = torch.ones((bsz, n, candidates), dtype=st1.dtype, device=st1.device)
+    score = torch.zeros_like(survival)
+    for r in range(window):
+        left_idx = positions - r
+        right_idx = source_index - r
+        valid = candidate_mask & (left_idx >= 0) & (right_idx >= 0)
+        left1 = _gather_sequence(st1, left_idx)
+        right1 = _gather_sequence(st1, right_idx)
+        left2 = _gather_sequence(st2, left_idx)
+        right2 = _gather_sequence(st2, right_idx)
+        eq = (left1 * right1).sum(-1) * (left2 * right2).sum(-1)
+        survival = survival * eq * valid.to(eq.dtype)
+        score = score + survival
+    return score
+
+
+# A callable owns shape specializations while the outer cache keeps exactly one
+# full-graph compiler island per static verification window. Specializations
+# are initialized once per input signature; already-ready calls do not take the
+# signature lock.
+_SOFT_MATCH_COMPILE_ENABLED = True
+_SOFT_MATCH_COMPILED: dict[int, Any] = {}
+_SoftMatchTensorSignature = tuple[
+    str,
+    int | None,
+    torch.dtype,
+    torch.layout,
+    tuple[int, ...],
+    tuple[int, ...],
+    int,
+    bool,
+]
+_SoftMatchSignature = tuple[
+    int,
+    bool,
+    bool,
+    tuple[
+        _SoftMatchTensorSignature,
+        _SoftMatchTensorSignature,
+        _SoftMatchTensorSignature,
+        _SoftMatchTensorSignature,
+    ],
+]
+_SOFT_MATCH_COMPILE_FAILURES: set[_SoftMatchSignature] = set()
+_SOFT_MATCH_COMPILE_READY: set[_SoftMatchSignature] = set()
+_SOFT_MATCH_SIGNATURE_LOCKS: dict[_SoftMatchSignature, threading.Lock] = {}
+_SOFT_MATCH_WINDOW_LOCKS: dict[int, threading.Lock] = {}
+_SOFT_MATCH_COMPILE_MASTER_LOCK = threading.Lock()
+
+
+def _soft_match_signature(
+    st1: Tensor,
+    st2: Tensor,
+    source_index: Tensor,
+    candidate_mask: Tensor,
+    window: int,
+) -> _SoftMatchSignature:
+    def tensor_signature(tensor: Tensor) -> _SoftMatchTensorSignature:
+        return (
+            tensor.device.type,
+            tensor.device.index,
+            tensor.dtype,
+            tensor.layout,
+            tuple(tensor.shape),
+            tuple(tensor.stride()),
+            int(tensor.storage_offset()),
+            tensor.requires_grad,
+        )
+
+    tensors = (st1, st2, source_index, candidate_mask)
+    return (
+        window,
+        torch.is_grad_enabled(),
+        torch.is_inference_mode_enabled(),
+        tuple(tensor_signature(tensor) for tensor in tensors),  # type: ignore[return-value]
+    )
+
+
+def _clear_soft_match_compile_cache() -> None:
+    """Clear all compiled soft-match process state, primarily for tests."""
+
+    with _SOFT_MATCH_COMPILE_MASTER_LOCK:
+        _SOFT_MATCH_COMPILED.clear()
+        _SOFT_MATCH_COMPILE_FAILURES.clear()
+        _SOFT_MATCH_COMPILE_READY.clear()
+        _SOFT_MATCH_SIGNATURE_LOCKS.clear()
+        _SOFT_MATCH_WINDOW_LOCKS.clear()
+
+
+def _soft_match(
+    st1: Tensor,
+    st2: Tensor,
+    source_index: Tensor,
+    candidate_mask: Tensor,
+    window: int,
+) -> Tensor:
+    """Use a static compiled island with eager fallback for forward failures."""
+
+    if not _SOFT_MATCH_COMPILE_ENABLED:
+        return _soft_match_torch(st1, st2, source_index, candidate_mask, window)
+
+    signature = _soft_match_signature(st1, st2, source_index, candidate_mask, window)
+    with _SOFT_MATCH_COMPILE_MASTER_LOCK:
+        signature_lock = _SOFT_MATCH_SIGNATURE_LOCKS.setdefault(
+            signature, threading.Lock()
+        )
+        window_lock = _SOFT_MATCH_WINDOW_LOCKS.setdefault(window, threading.Lock())
+        if signature in _SOFT_MATCH_COMPILE_FAILURES:
+            failed = True
+            ready = False
+            compiled = None
+        else:
+            failed = False
+            ready = signature in _SOFT_MATCH_COMPILE_READY
+            compiled = _SOFT_MATCH_COMPILED.get(window)
+    if failed:
+        return _soft_match_torch(st1, st2, source_index, candidate_mask, window)
+    if ready:
+        assert compiled is not None
+        try:
+            return compiled(st1, st2, source_index, candidate_mask)
+        except Exception:
+            with _SOFT_MATCH_COMPILE_MASTER_LOCK:
+                _SOFT_MATCH_COMPILE_FAILURES.add(signature)
+            return _soft_match_torch(st1, st2, source_index, candidate_mask, window)
+
+    with signature_lock:
+        with _SOFT_MATCH_COMPILE_MASTER_LOCK:
+            if signature in _SOFT_MATCH_COMPILE_FAILURES:  # pragma: no cover - race
+                failed = True
+                ready = False
+                compiled = None
+            else:
+                failed = False
+                ready = signature in _SOFT_MATCH_COMPILE_READY
+                compiled = _SOFT_MATCH_COMPILED.get(window)
+        if not failed and not ready and compiled is None:
+            with window_lock:
+                with _SOFT_MATCH_COMPILE_MASTER_LOCK:
+                    compiled = _SOFT_MATCH_COMPILED.get(window)
+                if compiled is None:  # pragma: no branch - concurrent recheck
+                    try:
+                        compiled = torch.compile(
+                            lambda a, b, source, mask: _soft_match_torch(
+                                a, b, source, mask, window
+                            ),
+                            fullgraph=True,
+                            dynamic=False,
+                        )
+                    except Exception:
+                        with _SOFT_MATCH_COMPILE_MASTER_LOCK:
+                            _SOFT_MATCH_COMPILE_FAILURES.add(signature)
+                        return _soft_match_torch(
+                            st1, st2, source_index, candidate_mask, window
+                        )
+                    with _SOFT_MATCH_COMPILE_MASTER_LOCK:
+                        _SOFT_MATCH_COMPILED[window] = compiled
+
+        if not failed and not ready:
+            assert compiled is not None
+            try:
+                result = compiled(st1, st2, source_index, candidate_mask)
+            except Exception:
+                # Keep the window callable: an unsupported shape, dtype, or
+                # device must not disable its other specializations.
+                with _SOFT_MATCH_COMPILE_MASTER_LOCK:
+                    _SOFT_MATCH_COMPILE_FAILURES.add(signature)
+                return _soft_match_torch(st1, st2, source_index, candidate_mask, window)
+
+            # torch.compile is lazy, so the signature becomes ready only after
+            # its first forward execution succeeds. Deferred AOT backward
+            # errors are intentionally propagated to the caller.
+            with _SOFT_MATCH_COMPILE_MASTER_LOCK:
+                _SOFT_MATCH_COMPILE_READY.add(signature)
+            return result
+
+    if failed:  # pragma: no cover - concurrent recheck
+        return _soft_match_torch(st1, st2, source_index, candidate_mask, window)
+    assert ready and compiled is not None
+    try:
+        return compiled(st1, st2, source_index, candidate_mask)
+    except Exception:  # pragma: no cover - concurrent runtime failure
+        with _SOFT_MATCH_COMPILE_MASTER_LOCK:
+            _SOFT_MATCH_COMPILE_FAILURES.add(signature)
+        return _soft_match_torch(st1, st2, source_index, candidate_mask, window)
+
+
 def _st_categorical(
     logits: Tensor, temperature: float
 ) -> tuple[Tensor, Tensor, Tensor]:
@@ -575,6 +775,7 @@ class ROSA(nn.Module):
         virtual_scale: float = 0.0,
         neural_value_scale: float = 0.0,
         candidate_backend: CandidateBackend = "auto",
+        compile_soft_match: bool = False,
     ) -> None:
         super().__init__()
         if d_model <= 0:
@@ -595,6 +796,8 @@ class ROSA(nn.Module):
             )
         if not isinstance(soft_candidates_forward, bool):
             raise TypeError("soft_candidates_forward must be a bool")
+        if not isinstance(compile_soft_match, bool):
+            raise TypeError("compile_soft_match must be a bool")
         if selector_dim <= 0:
             raise ValueError("selector_dim must be > 0")
         if token_temperature <= 0 or retrieval_temperature <= 0:
@@ -625,6 +828,7 @@ class ROSA(nn.Module):
         self.sparse_old_candidates = sparse_old_candidates
         self.sparse_old_pool_size = sparse_old_pool_size
         self.soft_candidates_forward = soft_candidates_forward
+        self.compile_soft_match = compile_soft_match
         self.candidate_backend: CandidateBackend = candidate_backend
         self.selector_dim = selector_dim
         self.token_temperature = token_temperature
@@ -722,23 +926,14 @@ class ROSA(nn.Module):
         source_index: Tensor,
         candidate_mask: Tensor,
     ) -> Tensor:
-        bsz, n, candidates = source_index.shape
-        positions = torch.arange(n, device=source_index.device).view(1, n, 1)
-        positions = positions.expand(bsz, n, candidates)
-        survival = torch.ones((bsz, n, candidates), dtype=st1.dtype, device=st1.device)
-        score = torch.zeros_like(survival)
-        for r in range(self.soft_verify_window):
-            left_idx = positions - r
-            right_idx = source_index - r
-            valid = candidate_mask & (left_idx >= 0) & (right_idx >= 0)
-            left1 = _gather_sequence(st1, left_idx)
-            right1 = _gather_sequence(st1, right_idx)
-            left2 = _gather_sequence(st2, left_idx)
-            right2 = _gather_sequence(st2, right_idx)
-            eq = (left1 * right1).sum(-1) * (left2 * right2).sum(-1)
-            survival = survival * eq * valid.to(eq.dtype)
-            score = score + survival
-        return score
+        implementation = _soft_match if self.compile_soft_match else _soft_match_torch
+        return implementation(
+            st1,
+            st2,
+            source_index,
+            candidate_mask,
+            self.soft_verify_window,
+        )
 
     def _virtual_candidates(
         self,
@@ -754,9 +949,8 @@ class ROSA(nn.Module):
         ) & exact_mask.unsqueeze(-2)
         pool_mask = pool_mask & ~duplicate.any(dim=-1)
 
-        pool_z = _gather_sequence(z_a, pool)
         q = self.virtual_query(z_a).unsqueeze(-2)
-        k = self.virtual_key(pool_z)
+        k = self._virtual_pool_keys(z_a, pool)
         router_score = (q * k).sum(-1) / math.sqrt(self.selector_dim)
         masked = router_score.masked_fill(~pool_mask, -1e9)
         _, top_idx = torch.topk(masked, k=self.virtual_candidates, dim=-1)
@@ -765,6 +959,12 @@ class ROSA(nn.Module):
         selected_router = router_score.gather(-1, top_idx)
         return selected_source, selected_mask, selected_router
 
+    def _virtual_pool_keys(self, z_a: Tensor, pool: Tensor) -> Tensor:
+        return _gather_sequence(self.virtual_key(z_a), pool)
+
+    def _candidate_selector_keys(self, z_a: Tensor, source: Tensor) -> Tensor:
+        return _gather_sequence(self.selector_key(z_a), source)
+
     def _candidate_symbolic_values(
         self,
         st1: Tensor,
@@ -772,11 +972,14 @@ class ROSA(nn.Module):
         next_position: Tensor,
         mask: Tensor,
     ) -> Tensor:
-        g1 = _gather_sequence(st1, next_position)
-        g2 = _gather_sequence(st2, next_position)
-        e1 = g1 @ self.symbol_embedding_1.weight
-        e2 = g2 @ self.symbol_embedding_2.weight
-        return (e1 + e2) * mask.unsqueeze(-1).to(e1.dtype)
+        symbol_sequence = (
+            st1 @ self.symbol_embedding_1.weight + st2 @ self.symbol_embedding_2.weight
+        )
+        symbolic_value = _gather_sequence(symbol_sequence, next_position)
+        return symbolic_value * mask.unsqueeze(-1).to(symbolic_value.dtype)
+
+    def _candidate_neural_values(self, z_a: Tensor, next_position: Tensor) -> Tensor:
+        return _gather_sequence(self.value_proj(z_a), next_position)
 
     def _hybrid_soft_candidates(
         self,
@@ -982,10 +1185,9 @@ class ROSA(nn.Module):
             dim=-1,
         )
 
-        source_z = _gather_sequence(z_a, source)
         query = self.selector_query(z_a).unsqueeze(-2)
-        key = self.selector_key(source_z)
-        semantic = (query * key).sum(-1) / math.sqrt(self.selector_dim)
+        cand_key = self._candidate_selector_keys(z_a, source)
+        semantic = (query * cand_key).sum(-1) / math.sqrt(self.selector_dim)
         learned = semantic + self.feature_mlp(features).squeeze(-1)
         learned = learned + self.kind_bias[kind]
         learned[..., -1] = learned[..., -1] + self.null_head(z_a).squeeze(-1)
@@ -1037,14 +1239,13 @@ class ROSA(nn.Module):
         symbolic_value = self._candidate_symbolic_values(
             st1, st2, next_position, non_null_mask
         )
-        next_z = _gather_sequence(z_a, next_position)
-        cand_key = self.selector_key(source_z)
         query_expanded = query.expand_as(cand_key)
         value_gate = torch.sigmoid(
             self.value_gate_head(torch.cat([query_expanded, cand_key], dim=-1))
         ).squeeze(-1)
         value_gate = value_gate * non_null_mask.to(z_a.dtype)
-        neural_value = self.value_proj(next_z) * value_gate.unsqueeze(-1)
+        neural_value = self._candidate_neural_values(z_a, next_position)
+        neural_value = neural_value * value_gate.unsqueeze(-1)
         candidate_value = symbolic_value + self.neural_value_scale * neural_value
         hybrid_enabled = bool(
             self.dense_recent_candidates or self.sparse_old_candidates
@@ -1098,16 +1299,10 @@ class ROSA(nn.Module):
         chosen_next = (chosen_source + 1).clamp(min=0, max=n - 1)
         chosen_id1 = hard_tokens // self.codebook_sizes[1]
         chosen_id2 = hard_tokens % self.codebook_sizes[1]
-        # Gather both factors to make the chosen token explicitly causal and
-        # avoid depending on any flattened-token table.
-        c1 = _gather_sequence(
-            F.one_hot(chosen_id1, self.codebook_sizes[0]).to(z_a.dtype),
-            chosen_next,
-        ).argmax(-1)
-        c2 = _gather_sequence(
-            F.one_hot(chosen_id2, self.codebook_sizes[1]).to(z_a.dtype),
-            chosen_next,
-        ).argmax(-1)
+        # The IDs are already discrete. Gather them directly instead of
+        # allocating two one-hot sequences only to immediately argmax them.
+        c1 = _gather_sequence(chosen_id1.unsqueeze(-1), chosen_next).squeeze(-1)
+        c2 = _gather_sequence(chosen_id2.unsqueeze(-1), chosen_next).squeeze(-1)
         chosen_token = c1 * self.codebook_sizes[1] + c2
         chosen_token = torch.where(
             chosen_kind == NULL_KIND, -torch.ones_like(chosen_token), chosen_token
