@@ -9,7 +9,8 @@ frequency deltas are added.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -1019,6 +1020,25 @@ class CandidateBuffers:
     state_id: np.ndarray
     frequency: np.ndarray
     count: np.ndarray
+    _validation_signature: tuple[int, ...] | None = field(
+        default=None, init=False, repr=False
+    )
+    _output_ranges: tuple[tuple[int, int], ...] = field(
+        default=(), init=False, repr=False
+    )
+    _state_ranges: tuple[tuple[int, int], ...] = field(
+        default=(), init=False, repr=False
+    )
+    _tensor_signature: tuple[int, ...] | None = field(
+        default=None, init=False, repr=False
+    )
+    _numpy_outputs: tuple[np.ndarray, ...] = field(default=(), init=False, repr=False)
+    _cpu_outputs: tuple[Tensor, ...] = field(default=(), init=False, repr=False)
+    _device_outputs: dict[tuple[str, int | None], tuple[Tensor, ...]] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    _slot_index: np.ndarray | None = field(default=None, init=False, repr=False)
+    _valid: np.ndarray | None = field(default=None, init=False, repr=False)
 
 
 def init_candidate_buffers(
@@ -1214,6 +1234,76 @@ def _candidate_step_from_arrays(
     )
 
 
+def _candidate_step_from_buffers(
+    state: CandidateState,
+    buffers: CandidateBuffers,
+    arrays: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+    device: torch.device,
+) -> CandidateStep:
+    """Build an ephemeral result while reusing every NumPy/Torch output."""
+
+    source, match_length, state_id, frequency, count = arrays
+    signature = tuple(id(array) for array in arrays)
+    if buffers._tensor_signature != signature:
+        slots = state.suffix_k * state.occurrences_r
+        slot_shape = (1,) * count.ndim + (slots,)
+        buffers._slot_index = np.arange(slots, dtype=np.int32).reshape(slot_shape)
+        mask = np.empty(source.shape, dtype=np.bool_)
+        rosa_slot = np.empty(count.shape, dtype=np.int64)
+        rosa_predicted = np.empty(count.shape, dtype=np.int64)
+        buffers._valid = np.empty(count.shape, dtype=np.bool_)
+        buffers._numpy_outputs = (
+            source,
+            match_length,
+            state_id,
+            frequency,
+            mask,
+            rosa_slot,
+            source[..., 0],
+            match_length[..., 0],
+            rosa_predicted,
+        )
+        buffers._cpu_outputs = tuple(
+            torch.from_numpy(array) for array in buffers._numpy_outputs
+        )
+        buffers._device_outputs.clear()
+        buffers._tensor_signature = signature
+
+    mask = buffers._numpy_outputs[4]
+    rosa_slot = buffers._numpy_outputs[5]
+    rosa_source = buffers._numpy_outputs[6]
+    rosa_predicted = buffers._numpy_outputs[8]
+    assert buffers._slot_index is not None
+    assert buffers._valid is not None
+    np.less(buffers._slot_index, count[..., None], out=mask)
+    np.greater(count, 0, out=buffers._valid)
+    rosa_slot.fill(-1)
+    np.copyto(rosa_slot, 0, where=buffers._valid)
+    rosa_predicted.fill(-1)
+    for index in np.ndindex(count.shape):
+        if buffers._valid[index]:
+            batch_index = index[0]
+            source_position = int(rosa_source[index])
+            rosa_predicted[index] = state.history[batch_index, source_position + 1]
+
+    if device.type == "cpu":
+        outputs = buffers._cpu_outputs
+    else:  # pragma: no cover - exercised by CUDA validation
+        device_key = (device.type, device.index)
+        outputs = buffers._device_outputs.get(device_key, ())
+        if not outputs:
+            outputs = tuple(
+                torch.empty_like(output, device=device)
+                for output in buffers._cpu_outputs
+            )
+            buffers._device_outputs[device_key] = outputs
+        for destination, source_tensor in zip(
+            outputs, buffers._cpu_outputs, strict=True
+        ):
+            destination.copy_(source_tensor, non_blocking=False)
+    return CandidateStep(*outputs)
+
+
 def _validate_candidate_buffers(
     state: CandidateState,
     buffers: CandidateBuffers,
@@ -1247,20 +1337,63 @@ def _validate_candidate_buffers(
         if not array.flags.writeable:
             raise ValueError(f"buffers.{name} must be writable")
         arrays.append(array)
-    all_call_arrays = [tokens, *arrays]
-    for first_index, first in enumerate(all_call_arrays):
-        for second in all_call_arrays[first_index + 1 :]:
-            if np.shares_memory(first, second):
-                raise ValueError("tokens and candidate buffers must not overlap")
+    return arrays[0], arrays[1], arrays[2], arrays[3], arrays[4]
+
+
+def _validate_candidate_buffer_overlap(
+    state: CandidateState,
+    buffers: CandidateBuffers,
+    tokens: np.ndarray,
+    arrays: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+) -> None:
+    """Validate fallback buffers; current native companions do this in C++."""
+
     state_arrays = [
         value for value in state.__dict__.values() if isinstance(value, np.ndarray)
     ]
-    for array in all_call_arrays:
-        if any(np.shares_memory(array, state_array) for state_array in state_arrays):
-            raise ValueError(
-                "candidate buffers must not overlap candidate state storage"
+
+    def memory_range(array: np.ndarray) -> tuple[int, int]:
+        begin = int(array.__array_interface__["data"][0])
+        return begin, begin + array.nbytes
+
+    signature_arrays = [*arrays, *state_arrays]
+    signature = tuple(
+        item for array in signature_arrays for item in (id(array), *memory_range(array))
+    )
+    if buffers._validation_signature != signature:
+        output_ranges = tuple(memory_range(array) for array in arrays)
+        state_ranges = tuple(memory_range(array) for array in state_arrays)
+
+        def overlaps(first: tuple[int, int], second: tuple[int, int]) -> bool:
+            return (
+                first[0] < second[1]
+                and second[0] < first[1]
+                and first[0] != first[1]
+                and second[0] != second[1]
             )
-    return arrays[0], arrays[1], arrays[2], arrays[3], arrays[4]
+
+        for first_index, first in enumerate(output_ranges):
+            if any(
+                overlaps(first, second) for second in output_ranges[first_index + 1 :]
+            ):
+                raise ValueError("candidate output buffers must not overlap")
+            if any(overlaps(first, state_range) for state_range in state_ranges):
+                raise ValueError(
+                    "candidate buffers must not overlap candidate state storage"
+                )
+        buffers._validation_signature = signature
+        buffers._output_ranges = output_ranges
+        buffers._state_ranges = state_ranges
+
+    token_range = memory_range(tokens)
+    if any(
+        token_range[0] < end
+        and begin < token_range[1]
+        and token_range[0] != token_range[1]
+        and begin != end
+        for begin, end in (*buffers._output_ranges, *buffers._state_ranges)
+    ):
+        raise ValueError("tokens and candidate storage must not overlap")
 
 
 def _native_candidate_into(
@@ -1268,6 +1401,7 @@ def _native_candidate_into(
     method: str,
     tokens: np.ndarray,
     arrays: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+    validate_fallback: Callable[[], None],
 ) -> bool:  # pragma: no cover - optional native companion
     if state.native_state is False:
         return False
@@ -1292,6 +1426,7 @@ def _native_candidate_into(
     allocating_method = getattr(state.native_state, method.removesuffix("_into"), None)
     if allocating_method is None:
         return False
+    validate_fallback()
     allocated = allocating_method(tokens)
     for destination, source in zip(arrays, allocated, strict=True):
         np.copyto(destination, source)
@@ -1316,7 +1451,18 @@ def forward_candidates_step_into(
     cpu_tokens = tokens.detach().to(device="cpu", dtype=torch.long).contiguous()
     token_array = cpu_tokens.numpy()
     arrays = _validate_candidate_buffers(state, buffers, token_array)
-    if not _native_candidate_into(state, "step_into", token_array, arrays):
+    overlap_validated = False
+
+    def validate_overlap() -> None:
+        nonlocal overlap_validated
+        if not overlap_validated:
+            _validate_candidate_buffer_overlap(state, buffers, token_array, arrays)
+            overlap_validated = True
+
+    if not _native_candidate_into(
+        state, "step_into", token_array, arrays, validate_overlap
+    ):
+        validate_overlap()
         allocated = _step_batch_kernel(
             token_array,
             state.position,
@@ -1352,7 +1498,7 @@ def forward_candidates_step_into(
         state.positions.fill(state.position)
     else:
         state.positions.fill(state.position)
-    return _candidate_step_from_arrays(state, arrays, device)
+    return _candidate_step_from_buffers(state, buffers, arrays, device)
 
 
 def prefill_candidates_into(
@@ -1374,7 +1520,18 @@ def prefill_candidates_into(
     arrays = _validate_candidate_buffers(
         state, buffers, token_array, sequence_length=sequence_length
     )
-    if not _native_candidate_into(state, "prefill_into", token_array, arrays):
+    overlap_validated = False
+
+    def validate_overlap() -> None:
+        nonlocal overlap_validated
+        if not overlap_validated:
+            _validate_candidate_buffer_overlap(state, buffers, token_array, arrays)
+            overlap_validated = True
+
+    if not _native_candidate_into(
+        state, "prefill_into", token_array, arrays, validate_overlap
+    ):
+        validate_overlap()
         allocated = _prefill_candidate_kernel(
             token_array,
             state.suffix_k,
@@ -1407,7 +1564,7 @@ def prefill_candidates_into(
             np.copyto(destination, source)
         state.position = sequence_length
     state.positions.fill(state.position)
-    return _candidate_step_from_arrays(state, arrays, device)
+    return _candidate_step_from_buffers(state, buffers, arrays, device)
 
 
 def forward_candidates_step(state: CandidateState, tokens: Tensor) -> CandidateStep:

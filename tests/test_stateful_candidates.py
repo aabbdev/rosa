@@ -151,6 +151,8 @@ class TestStatefulCandidates(unittest.TestCase):
         retained = forward_candidates_step_into(state, tokens[:, 0], buffers)
         retained_source = retained.source_index.clone()
         current = forward_candidates_step_into(state, tokens[:, 1], buffers)
+        self.assertIs(retained.source_index, current.source_index)
+        self.assertIs(retained.mask, current.mask)
         expected = build_hard_candidates(tokens[:, :2], suffix_k=3, occurrences_r=2)
         for field in _FIELDS:
             self.assertTrue(
@@ -167,6 +169,25 @@ class TestStatefulCandidates(unittest.TestCase):
         for field in _FIELDS:
             self.assertTrue(
                 torch.equal(getattr(actual, field), getattr(expected, field))
+            )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
+    def test_caller_owned_buffers_reuse_cuda_storage(self) -> None:
+        tokens = torch.tensor([[0, 0], [3, 3]], device="cuda")
+        state = init_candidate_state(2, 2, suffix_k=2, occurrences_r=2)
+        buffers = init_candidate_buffers(state)
+        first = forward_candidates_step_into(state, tokens[:, 0], buffers)
+        source_pointer = first.source_index.data_ptr()
+        second = forward_candidates_step_into(state, tokens[:, 1], buffers)
+        self.assertEqual(second.source_index.device.type, "cuda")
+        self.assertEqual(second.source_index.data_ptr(), source_pointer)
+        expected = build_hard_candidates(tokens.cpu(), suffix_k=2, occurrences_r=2)
+        for field in _FIELDS:
+            self.assertTrue(
+                torch.equal(
+                    getattr(second, field).cpu(), getattr(expected, field)[:, 1]
+                ),
+                field,
             )
 
     def test_caller_owned_buffer_validation_and_allocating_snapshots(self) -> None:
@@ -189,10 +210,163 @@ class TestStatefulCandidates(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "writable"):
             forward_candidates_step_into(wrong_state, torch.tensor([0]), buffers)
 
+        for replacement, error in (
+            (object(), TypeError),
+            (np.empty((1, 4), dtype=np.int32), TypeError),
+            (np.empty((1, 8), dtype=np.int64)[:, ::2], ValueError),
+        ):
+            buffers = init_candidate_buffers(wrong_state)
+            buffers.source_index = replacement  # type: ignore[assignment]
+            with self.assertRaises(error):
+                forward_candidates_step_into(wrong_state, torch.tensor([0]), buffers)
+
+        buffers = init_candidate_buffers(wrong_state)
+        buffers.match_length = buffers.source_index
+        with self.assertRaisesRegex(ValueError, "overlap"):
+            forward_candidates_step_into(wrong_state, torch.tensor([0]), buffers)
+
+        token_overlap_state = init_candidate_state(1, 1, suffix_k=1, occurrences_r=1)
+        token_overlap_state.native_state = False
+        buffers = init_candidate_buffers(token_overlap_state)
+        with self.assertRaisesRegex(ValueError, "tokens"):
+            forward_candidates_step_into(
+                token_overlap_state,
+                torch.from_numpy(buffers.source_index.reshape(-1)),
+                buffers,
+            )
+
+        buffers = init_candidate_buffers(wrong_state)
+        buffers.source_index = wrong_state.lazy_prefix.reshape(1, -1)[:, :4]
+        with self.assertRaisesRegex(ValueError, "state storage"):
+            forward_candidates_step_into(wrong_state, torch.tensor([0]), buffers)
+
+        with self.assertRaisesRegex(TypeError, "CandidateBuffers"):
+            forward_candidates_step_into(
+                wrong_state,
+                torch.tensor([0]),
+                object(),  # type: ignore[arg-type]
+            )
+
         with self.assertRaisesRegex(TypeError, "CandidateState"):
             init_candidate_buffers(object())
         with self.assertRaisesRegex(ValueError, "sequence_length"):
             init_candidate_buffers(wrong_state, sequence_length=-1)
+
+        ragged = init_candidate_state_internal(1, 2, ragged=True)
+        with self.assertRaisesRegex(RuntimeError, "ragged"):
+            forward_candidates_step_into(
+                ragged, torch.tensor([0]), init_candidate_buffers(ragged)
+            )
+        with self.assertRaisesRegex(RuntimeError, "ragged"):
+            prefill_candidates_into(
+                ragged,
+                torch.tensor([[0]]),
+                init_candidate_buffers(ragged, sequence_length=1),
+            )
+
+        full = init_candidate_state(1, 1)
+        full.native_state = False
+        full_buffers = init_candidate_buffers(full)
+        forward_candidates_step_into(full, torch.tensor([0]), full_buffers)
+        with self.assertRaisesRegex(RuntimeError, "capacity"):
+            forward_candidates_step_into(full, torch.tensor([0]), full_buffers)
+
+        nonempty = init_candidate_state(1, 2)
+        nonempty.native_state = False
+        forward_candidates_step_into(
+            nonempty, torch.tensor([0]), init_candidate_buffers(nonempty)
+        )
+        with self.assertRaisesRegex(RuntimeError, "empty"):
+            prefill_candidates_into(
+                nonempty,
+                torch.tensor([[0]]),
+                init_candidate_buffers(nonempty, sequence_length=1),
+            )
+
+        short = init_candidate_state(1, 1)
+        with self.assertRaisesRegex(RuntimeError, "capacity"):
+            prefill_candidates_into(
+                short,
+                torch.tensor([[0, 1]]),
+                init_candidate_buffers(short, sequence_length=2),
+            )
+
+        native_like = init_candidate_state(1, 1)
+        native_buffers = init_candidate_buffers(native_like, sequence_length=1)
+
+        def fill_like_native(
+            candidate_state: CandidateState,
+            method: str,
+            tokens: np.ndarray,
+            arrays: tuple[np.ndarray, ...],
+            validate_fallback: object,
+        ) -> bool:
+            self.assertEqual(method, "prefill_into")
+            self.assertTrue(callable(validate_fallback))
+            validate_fallback()  # type: ignore[operator]
+            validate_fallback()  # type: ignore[operator]
+            for array in arrays:
+                array.fill(0)
+            candidate_state.position = tokens.shape[1]
+            return True
+
+        with patch(
+            "rosa._stateful_candidates_numba._native_candidate_into",
+            side_effect=fill_like_native,
+        ):
+            prefill_candidates_into(native_like, torch.tensor([[0]]), native_buffers)
+        self.assertEqual(native_like.positions.tolist(), [1])
+
+        old_state = init_candidate_state(1, 1, suffix_k=2, occurrences_r=2)
+
+        class AllocatingOnlyNative:
+            def step(self, tokens: np.ndarray) -> tuple[np.ndarray, ...]:
+                old_state.position += 1
+                old_state.positions.fill(old_state.position)
+                return (
+                    np.full((1, 4), -1, dtype=np.int64),
+                    np.zeros((1, 4), dtype=np.int64),
+                    np.full((1, 4), -1, dtype=np.int64),
+                    np.zeros((1, 4), dtype=np.int64),
+                    np.zeros(1, dtype=np.int32),
+                )
+
+        old_state.native_state = AllocatingOnlyNative()
+        old_result = forward_candidates_step_into(
+            old_state, torch.tensor([0]), init_candidate_buffers(old_state)
+        )
+        self.assertFalse(bool(old_result.mask.any()))
+
+        missing_state = init_candidate_state(1, 1)
+        missing_state.native_state = object()
+        missing_result = forward_candidates_step_into(
+            missing_state, torch.tensor([0]), init_candidate_buffers(missing_state)
+        )
+        self.assertEqual(missing_result.rosa_slot.tolist(), [-1])
+
+        repeated_validation = init_candidate_state(1, 1)
+        repeated_validation.native_state = False
+
+        def miss_after_validating(
+            candidate_state: CandidateState,
+            method: str,
+            tokens: np.ndarray,
+            arrays: tuple[np.ndarray, ...],
+            validate_fallback: object,
+        ) -> bool:
+            validate_fallback()  # type: ignore[operator]
+            validate_fallback()  # type: ignore[operator]
+            return False
+
+        with patch(
+            "rosa._stateful_candidates_numba._native_candidate_into",
+            side_effect=miss_after_validating,
+        ):
+            forward_candidates_step_into(
+                repeated_validation,
+                torch.tensor([0]),
+                init_candidate_buffers(repeated_validation),
+            )
 
     def test_ragged_inactive_reset_capacity_and_recycle(self) -> None:
         state = init_candidate_state_internal(

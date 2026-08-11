@@ -10,6 +10,7 @@ from rosa import (
     InferenceOutput,
     build_hard_candidates,
     forward_candidates_step,
+    forward_candidates_step_into,
     forward_step,
     init_candidate_buffers,
     init_candidate_state,
@@ -100,11 +101,21 @@ class TestUnifiedInferenceState(unittest.TestCase):
                 field,
             )
 
+        wrapper = init_inference_state(1, 1, mode="rich", suffix_k=2, occurrences_r=2)
+        wrapped = forward_candidates_step_into(
+            wrapper, torch.tensor(0), init_candidate_buffers(wrapper)
+        )
+        self.assertEqual(wrapped.source_index.ndim, 1)
+
         top1 = init_inference_state(1, 1)
         with self.assertRaisesRegex(ValueError, "rich"):
             init_candidate_buffers(top1)
         with self.assertRaisesRegex(ValueError, "uniform rich"):
             top1.step_into(torch.tensor([0]), buffers)
+
+        rich_ragged = init_inference_state(1, 1, mode="rich", ragged=True)
+        with self.assertRaisesRegex(ValueError, "uniform rich"):
+            rich_ragged.step_into(torch.tensor([0]), buffers)
 
     def test_positions_are_copies_and_uniform_position_is_preserved(self) -> None:
         uniform = init_inference_state(2, 2)
