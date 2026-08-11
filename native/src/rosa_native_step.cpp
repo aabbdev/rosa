@@ -2,12 +2,192 @@
 #include <pybind11/pybind11.h>
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <cstdlib>
 #include <cstdint>
+#include <exception>
+#include <functional>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <system_error>
+#include <thread>
 #include <vector>
 
 namespace py = pybind11;
+
+namespace {
+
+constexpr size_t kMaximumNativeThreads = 16;
+
+size_t native_thread_count(int64_t rows) {
+  if (rows <= 1)
+    return 1;
+  size_t available = std::thread::hardware_concurrency();
+  if (available == 0)
+    available = 1;
+  size_t requested = available;
+  if (const char *value = std::getenv("ROSA_NATIVE_THREADS")) {
+    try {
+      const std::string text(value);
+      if (text.empty() ||
+          !std::all_of(text.begin(), text.end(), [](unsigned char character) {
+            return character >= '0' && character <= '9';
+          }))
+        throw std::invalid_argument("thread count must contain only digits");
+      size_t consumed = 0;
+      const unsigned long parsed = std::stoul(text, &consumed);
+      if (consumed == text.size() && parsed > 0)
+        requested = static_cast<size_t>(parsed);
+      else
+        requested = 1;
+    } catch (const std::exception &) {
+      requested = 1;
+    }
+  }
+  return std::max<size_t>(
+      1, std::min({requested, available, kMaximumNativeThreads,
+                   static_cast<size_t>(rows)}));
+}
+
+// A pool belongs to one native state. Its workers never touch Python and stay
+// alive across step/prefill calls; this avoids singleton shutdown ordering and
+// lets ROSA_NATIVE_THREADS be selected independently when each state is made.
+class RowThreadPool {
+public:
+  explicit RowThreadPool(int64_t rows) : thread_count_(native_thread_count(rows)) {
+    try {
+      for (size_t worker = 1; worker < thread_count_; ++worker)
+        workers_.emplace_back([this] { worker_loop(); });
+    } catch (...) {
+      // Without this cleanup, unwinding a partially constructed vector of
+      // joinable std::threads calls std::terminate. Retain a serial pool.
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stopping_ = true;
+        ++generation_;
+      }
+      work_ready_.notify_all();
+      for (std::thread &worker : workers_)
+        worker.join();
+      workers_.clear();
+      thread_count_ = 1;
+      return;
+    }
+    std::unique_lock<std::mutex> lock(mutex_);
+    workers_ready_.wait(lock,
+                        [this] { return ready_workers_ == workers_.size(); });
+  }
+
+  RowThreadPool(const RowThreadPool &) = delete;
+  RowThreadPool &operator=(const RowThreadPool &) = delete;
+
+  size_t worker_count() const { return workers_.size(); }
+
+  ~RowThreadPool() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stopping_ = true;
+      ++generation_;
+    }
+    work_ready_.notify_all();
+    for (std::thread &worker : workers_)
+      worker.join();
+  }
+
+  template <typename Function>
+  void parallel_for_rows(int64_t rows, int64_t minimum_parallel_rows,
+                         Function &&function) {
+    if (rows < minimum_parallel_rows || workers_.empty()) {
+      for (int64_t row = 0; row < rows; ++row)
+        function(row);
+      return;
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      next_row_.store(0, std::memory_order_relaxed);
+      end_row_ = rows;
+      cancelled_.store(false, std::memory_order_relaxed);
+      exception_ = nullptr;
+      function_ = std::forward<Function>(function);
+      active_workers_ = workers_.size();
+      ++generation_;
+    }
+    work_ready_.notify_all();
+    run_rows();
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      work_done_.wait(lock, [this] { return active_workers_ == 0; });
+      function_ = nullptr;
+      if (exception_)
+        std::rethrow_exception(exception_);
+    }
+  }
+
+private:
+  void capture_exception() {
+    cancelled_.store(true, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!exception_)
+      exception_ = std::current_exception();
+  }
+
+  void run_rows() {
+    try {
+      while (!cancelled_.load(std::memory_order_relaxed)) {
+        const int64_t row = next_row_.fetch_add(1, std::memory_order_relaxed);
+        if (row >= end_row_)
+          break;
+        function_(row);
+      }
+    } catch (...) {
+      capture_exception();
+    }
+  }
+
+  void worker_loop() {
+    size_t observed_generation = 0;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      ++ready_workers_;
+      workers_ready_.notify_one();
+    }
+    for (;;) {
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        work_ready_.wait(lock, [this, observed_generation] {
+          return stopping_ || generation_ != observed_generation;
+        });
+        if (stopping_)
+          return;
+        observed_generation = generation_;
+      }
+      run_rows();
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (--active_workers_ == 0)
+          work_done_.notify_one();
+      }
+    }
+  }
+
+  size_t thread_count_;
+  std::vector<std::thread> workers_;
+  std::mutex mutex_;
+  std::condition_variable work_ready_, work_done_, workers_ready_;
+  std::function<void(int64_t)> function_;
+  std::atomic<int64_t> next_row_{0};
+  std::atomic<bool> cancelled_{false};
+  int64_t end_row_ = 0;
+  size_t generation_ = 0, active_workers_ = 0, ready_workers_ = 0;
+  bool stopping_ = false;
+  std::exception_ptr exception_;
+};
+
+} // namespace
 
 class NativeState {
 public:
@@ -70,21 +250,25 @@ public:
     if (tokens.ndim() != 1 || tokens.shape(0) != batch_) {
       throw py::value_error("tokens must be contiguous int64 [batch_size]");
     }
-    if (position_ >= max_length_) {
-      throw std::runtime_error("inference state capacity exceeded");
-    }
     py::array_t<int64_t> output(batch_);
     const int64_t *in = tokens.data();
     int64_t *out = output.mutable_data();
+    ensure_pool(64);
+    std::unique_lock<std::mutex> call_lock;
     {
       py::gil_scoped_release release;
-      for (int64_t b = 0; b < batch_; ++b)
+      call_lock = std::unique_lock<std::mutex>(call_mutex_);
+      if (position_ >= max_length_)
+        throw std::runtime_error("inference state capacity exceeded");
+      parallel_for_rows(64, [&](int64_t b) {
         out[b] = step_row(b, in[b], position_);
+      });
     }
     ++position_;
     std::fill(positions_.mutable_data(), positions_.mutable_data() + batch_,
               position_);
     state_.attr("position") = py::int_(position_);
+    call_lock.unlock();
     return output;
   }
 
@@ -115,24 +299,33 @@ public:
                      ? static_cast<const bool *>(reset_object.data())[b]
                      : static_cast<const uint8_t *>(reset_object.data())[b] != 0;
     }
-    for (int64_t b = 0; b < batch_; ++b) {
-      if (active[b] && !reset[b] && positions_.data()[b] >= max_length_)
-        throw std::runtime_error("inference state capacity exceeded");
-    }
     py::array_t<int64_t> output(batch_);
     std::fill(output.mutable_data(), output.mutable_data() + batch_, int64_t{-1});
+    std::vector<int64_t> next_positions(batch_);
+    std::unique_lock<std::mutex> call_lock;
     {
       py::gil_scoped_release release;
+      call_lock = std::unique_lock<std::mutex>(call_mutex_);
       for (int64_t b = 0; b < batch_; ++b) {
+        if (active[b] && !reset[b] && positions_.data()[b] >= max_length_)
+          throw std::runtime_error("inference state capacity exceeded");
+      }
+      for (int64_t b = 0; b < batch_; ++b) {
+        const int64_t current_position =
+            active[b] && reset[b] ? 0 : positions_.data()[b];
+        next_positions[b] = current_position;
         if (!active[b])
           continue;
         if (reset[b])
           reset_row(b);
-        const int64_t position = positions_.data()[b];
-        output.mutable_data()[b] = step_row(b, tokens.data()[b], position);
-        positions_.mutable_data()[b] = position + 1;
+        output.mutable_data()[b] =
+            step_row(b, tokens.data()[b], current_position);
+        next_positions[b] = current_position + 1;
       }
     }
+    std::copy(next_positions.begin(), next_positions.end(),
+              positions_.mutable_data());
+    call_lock.unlock();
     return output;
   }
 
@@ -151,36 +344,56 @@ public:
       throw py::value_error(
           "tokens must be contiguous int64 [batch_size, sequence_length]");
     }
-    if (position_ != 0) {
-      throw std::runtime_error("prefill requires an empty inference state");
-    }
     const int64_t token_count = tokens.shape(1);
-    if (token_count > max_length_) {
-      throw std::runtime_error("inference state capacity exceeded");
-    }
     py::array_t<int64_t> output({batch_, token_count});
-    if (token_count == 0)
-      return output;
     const int64_t *in = tokens.data();
     int64_t *out = output.mutable_data();
+    ensure_pool(4);
+    std::unique_lock<std::mutex> call_lock;
     {
       py::gil_scoped_release release;
-      for (int64_t b = 0; b < batch_; ++b) {
-        prefill_row(b, in + b * token_count, token_count,
-                    out + b * token_count);
-      }
+      call_lock = std::unique_lock<std::mutex>(call_mutex_);
+      if (position_ != 0)
+        throw std::runtime_error("prefill requires an empty inference state");
+      if (token_count > max_length_)
+        throw std::runtime_error("inference state capacity exceeded");
+      if (token_count > 0)
+        parallel_for_rows(4, [&](int64_t b) {
+          prefill_row(b, in + b * token_count, token_count,
+                      out + b * token_count);
+        });
     }
     position_ = token_count;
     std::fill(positions_.mutable_data(), positions_.mutable_data() + batch_,
               position_);
     state_.attr("position") = py::int_(position_);
+    call_lock.unlock();
     return output;
   }
 
   int64_t position() const { return position_; }
   py::array_t<int64_t> positions() const { return positions_; }
+  size_t worker_count() const {
+    return row_pool_ ? row_pool_->worker_count() : 0;
+  }
 
 private:
+  void ensure_pool(int64_t minimum_parallel_rows) {
+    if (batch_ >= minimum_parallel_rows && !row_pool_)
+      row_pool_ = std::make_unique<RowThreadPool>(batch_);
+  }
+
+  template <typename Function>
+  void parallel_for_rows(int64_t minimum_parallel_rows, Function &&function) {
+    if (batch_ < minimum_parallel_rows) {
+      for (int64_t b = 0; b < batch_; ++b)
+        function(b);
+      return;
+    }
+    row_pool_->parallel_for_rows(batch_, minimum_parallel_rows,
+                                 std::forward<Function>(function));
+  }
+
   template <typename T>
   py::array_t<T, py::array::c_style>
   checked_vector(py::array object, const char *name, const char *dtype) const {
@@ -339,7 +552,6 @@ private:
     last_.mutable_data()[b] = 0;
     size_.mutable_data()[b] = 1;
     edge_count_.mutable_data()[b] = 0;
-    positions_.mutable_data()[b] = 0;
   }
 
   void replace_transition(int64_t b, int32_t state, int64_t token,
@@ -779,6 +991,8 @@ private:
   py::array_t<uint8_t, py::array::c_style> lazy_valid_;
   py::array_t<int64_t, py::array::c_style> positions_;
   std::vector<std::vector<int32_t>> occupied_slots_;
+  std::unique_ptr<RowThreadPool> row_pool_;
+  std::mutex call_mutex_;
   bool ragged_mode_ = false;
   int64_t batch_, max_length_, position_, state_capacity_, edge_capacity_,
       hash_capacity_;
@@ -853,8 +1067,6 @@ public:
     if ((tokens_object.flags() & py::array::c_style) == 0 ||
         tokens_object.ndim() != 1 || tokens_object.shape(0) != batch_)
       throw py::value_error("tokens must be contiguous int64 [batch_size]");
-    if (position_ >= max_length_)
-      throw std::runtime_error("candidate state capacity exceeded");
     auto tokens = py::cast<py::array_t<int64_t, py::array::c_style>>(tokens_object);
     const int64_t slots = suffix_k_ * occurrences_r_;
     py::array_t<int64_t> source({batch_, slots}), match_length({batch_, slots}),
@@ -868,20 +1080,27 @@ public:
               int64_t{-1});
     std::fill(candidate_frequency.mutable_data(),
               candidate_frequency.mutable_data() + batch_ * slots, int64_t{0});
+    ensure_pool(64);
+    std::unique_lock<std::mutex> call_lock;
     {
       py::gil_scoped_release release;
-      for (int64_t b = 0; b < batch_; ++b)
+      call_lock = std::unique_lock<std::mutex>(call_mutex_);
+      if (position_ >= max_length_)
+        throw std::runtime_error("candidate state capacity exceeded");
+      parallel_for_rows(64, [&](int64_t b) {
         count.mutable_data()[b] =
             step_row(b, tokens.data()[b], position_,
                      source.mutable_data() + b * slots,
                      match_length.mutable_data() + b * slots,
                      state_id.mutable_data() + b * slots,
                      candidate_frequency.mutable_data() + b * slots);
+      });
     }
     ++position_;
     std::fill(positions_.mutable_data(), positions_.mutable_data() + batch_,
               position_);
     state_.attr("position") = py::int_(position_);
+    call_lock.unlock();
     return py::make_tuple(source, match_length, state_id, candidate_frequency,
                           count);
   }
@@ -889,8 +1108,10 @@ public:
   void reset() {
     if (ragged_mode_)
       throw std::runtime_error("uniform reset is unavailable on a ragged candidate state");
+    std::unique_lock<std::mutex> call_lock;
     {
       py::gil_scoped_release release;
+      call_lock = std::unique_lock<std::mutex>(call_mutex_);
       for (int64_t b = 0; b < batch_; ++b)
         reset_row(b);
     }
@@ -898,6 +1119,7 @@ public:
     std::fill(positions_.mutable_data(), positions_.mutable_data() + batch_,
               int64_t{0});
     state_.attr("position") = py::int_(0);
+    call_lock.unlock();
   }
 
   py::tuple step_masked(py::array tokens_object, py::array active_object,
@@ -926,11 +1148,6 @@ public:
                               : static_cast<const uint8_t *>(active_object.data())[b] != 0;
       reset[b] = reset_bool ? static_cast<const bool *>(reset_object.data())[b]
                             : static_cast<const uint8_t *>(reset_object.data())[b] != 0;
-      const int64_t next_position = reset[b] ? 0 : positions_.data()[b];
-      if (active[b] && next_position < 0)
-        throw std::runtime_error("candidate position must be non-negative");
-      if (active[b] && next_position >= max_length_)
-        throw std::runtime_error("candidate state capacity exceeded");
     }
     const int64_t slots = suffix_k_ * occurrences_r_;
     py::array_t<int64_t> source({batch_, slots}), match_length({batch_, slots}),
@@ -941,24 +1158,38 @@ public:
     std::fill(state_id.mutable_data(), state_id.mutable_data() + batch_ * slots, int64_t{-1});
     std::fill(candidate_frequency.mutable_data(), candidate_frequency.mutable_data() + batch_ * slots, int64_t{0});
     std::fill(count.mutable_data(), count.mutable_data() + batch_, int32_t{0});
+    std::vector<int64_t> next_positions(batch_);
+    std::unique_lock<std::mutex> call_lock;
     {
       py::gil_scoped_release release;
+      call_lock = std::unique_lock<std::mutex>(call_mutex_);
       for (int64_t b = 0; b < batch_; ++b) {
+        const int64_t next_position = reset[b] ? 0 : positions_.data()[b];
+        if (active[b] && next_position < 0)
+          throw std::runtime_error("candidate position must be non-negative");
+        if (active[b] && next_position >= max_length_)
+          throw std::runtime_error("candidate state capacity exceeded");
+      }
+      for (int64_t b = 0; b < batch_; ++b) {
+        const int64_t current_position =
+            active[b] && reset[b] ? 0 : positions_.data()[b];
+        next_positions[b] = current_position;
         if (!active[b])
           continue;
-        if (reset[b]) {
+        if (reset[b])
           reset_row(b);
-          positions_.mutable_data()[b] = 0;
-        }
-        const int64_t position = positions_.data()[b];
         count.mutable_data()[b] = step_row(
-            b, tokens.data()[b], position, source.mutable_data() + b * slots,
+            b, tokens.data()[b], current_position,
+            source.mutable_data() + b * slots,
             match_length.mutable_data() + b * slots,
             state_id.mutable_data() + b * slots,
             candidate_frequency.mutable_data() + b * slots);
-        positions_.mutable_data()[b] = position + 1;
+        next_positions[b] = current_position + 1;
       }
     }
+    std::copy(next_positions.begin(), next_positions.end(),
+              positions_.mutable_data());
+    call_lock.unlock();
     return py::make_tuple(source, match_length, state_id, candidate_frequency,
                           count);
   }
@@ -974,17 +1205,25 @@ public:
         reset_object.ndim() != 1 || reset_object.shape(0) != batch_)
       throw py::value_error("reset must be contiguous [batch_size]");
     std::vector<uint8_t> reset(batch_);
+    std::vector<int64_t> next_positions(batch_);
     for (int64_t b = 0; b < batch_; ++b)
       reset[b] = reset_bool ? static_cast<const bool *>(reset_object.data())[b]
                             : static_cast<const uint8_t *>(reset_object.data())[b] != 0;
+    std::unique_lock<std::mutex> call_lock;
     {
       py::gil_scoped_release release;
-      for (int64_t b = 0; b < batch_; ++b)
+      call_lock = std::unique_lock<std::mutex>(call_mutex_);
+      for (int64_t b = 0; b < batch_; ++b) {
+        next_positions[b] = positions_.data()[b];
         if (reset[b]) {
           reset_row(b);
-          positions_.mutable_data()[b] = 0;
+          next_positions[b] = 0;
         }
+      }
     }
+    std::copy(next_positions.begin(), next_positions.end(),
+              positions_.mutable_data());
+    call_lock.unlock();
   }
 
   py::tuple prefill(py::array tokens_object) {
@@ -996,12 +1235,8 @@ public:
         tokens_object.ndim() != 2 || tokens_object.shape(0) != batch_)
       throw py::value_error(
           "tokens must be contiguous int64 [batch_size, sequence_length]");
-    if (position_ != 0)
-      throw std::runtime_error("prefill requires an empty candidate state");
     auto tokens = py::cast<py::array_t<int64_t, py::array::c_style>>(tokens_object);
     const int64_t sequence_length = tokens.shape(1);
-    if (sequence_length > max_length_)
-      throw std::runtime_error("candidate state capacity exceeded");
     const int64_t slots = suffix_k_ * occurrences_r_;
     py::array_t<int64_t> source({batch_, sequence_length, slots}),
         match_length({batch_, sequence_length, slots}),
@@ -1014,10 +1249,17 @@ public:
     std::fill(state_id.mutable_data(), state_id.mutable_data() + output_size, int64_t{-1});
     std::fill(candidate_frequency.mutable_data(), candidate_frequency.mutable_data() + output_size, int64_t{0});
     std::fill(count.mutable_data(), count.mutable_data() + batch_ * sequence_length, int32_t{0});
+    ensure_pool(4);
+    std::unique_lock<std::mutex> call_lock;
     {
       py::gil_scoped_release release;
-      for (int64_t position = 0; position < sequence_length; ++position)
-        for (int64_t b = 0; b < batch_; ++b) {
+      call_lock = std::unique_lock<std::mutex>(call_mutex_);
+      if (position_ != 0)
+        throw std::runtime_error("prefill requires an empty candidate state");
+      if (sequence_length > max_length_)
+        throw std::runtime_error("candidate state capacity exceeded");
+      parallel_for_rows(4, [&](int64_t b) {
+        for (int64_t position = 0; position < sequence_length; ++position) {
           const int64_t output_at = (b * sequence_length + position) * slots;
           count.mutable_data()[b * sequence_length + position] = step_row(
               b, tokens.data()[b * sequence_length + position], position,
@@ -1026,19 +1268,40 @@ public:
               state_id.mutable_data() + output_at,
               candidate_frequency.mutable_data() + output_at);
         }
+      });
     }
     position_ = sequence_length;
     std::fill(positions_.mutable_data(), positions_.mutable_data() + batch_,
               position_);
     state_.attr("position") = py::int_(position_);
+    call_lock.unlock();
     return py::make_tuple(source, match_length, state_id, candidate_frequency,
                           count);
   }
 
   int64_t position() const { return position_; }
   py::array_t<int64_t> positions() const { return positions_; }
+  size_t worker_count() const {
+    return row_pool_ ? row_pool_->worker_count() : 0;
+  }
 
 private:
+  void ensure_pool(int64_t minimum_parallel_rows) {
+    if (batch_ >= minimum_parallel_rows && !row_pool_)
+      row_pool_ = std::make_unique<RowThreadPool>(batch_);
+  }
+
+  template <typename Function>
+  void parallel_for_rows(int64_t minimum_parallel_rows, Function &&function) {
+    if (batch_ < minimum_parallel_rows) {
+      for (int64_t b = 0; b < batch_; ++b)
+        function(b);
+      return;
+    }
+    row_pool_->parallel_for_rows(batch_, minimum_parallel_rows,
+                                 std::forward<Function>(function));
+  }
+
   template <typename T> py::array_t<T, py::array::c_style> bind(const char *name) {
     py::object object = state_.attr(name);
     if (!py::isinstance<py::array_t<T>>(object))
@@ -1386,6 +1649,8 @@ private:
       hash_state_, hash_edge_, suffix_link_, length_, left_, right_, parent_,
       occurrence_size_, lazy_size_, stack_, last_, size_, edge_count_;
   std::vector<std::vector<int32_t>> occupied_slots_;
+  std::unique_ptr<RowThreadPool> row_pool_;
+  std::mutex call_mutex_;
   int64_t batch_, max_length_, suffix_k_, occurrences_r_, position_,
       state_capacity_, edge_capacity_, hash_capacity_;
   bool ragged_mode_ = false;
@@ -1399,7 +1664,8 @@ PYBIND11_MODULE(rosa_native_step, m) {
       .def("step_masked", &NativeState::step_masked)
       .def("prefill", &NativeState::prefill)
       .def_property_readonly("position", &NativeState::position)
-      .def_property_readonly("positions", &NativeState::positions);
+      .def_property_readonly("positions", &NativeState::positions)
+      .def_property_readonly("worker_count", &NativeState::worker_count);
   py::class_<NativeCandidateState>(m, "NativeCandidateState")
       .def(py::init<py::object>(), py::keep_alive<1, 2>())
       .def("step", &NativeCandidateState::step)
@@ -1408,6 +1674,8 @@ PYBIND11_MODULE(rosa_native_step, m) {
       .def("reset_masked", &NativeCandidateState::reset_masked)
       .def("prefill", &NativeCandidateState::prefill)
       .def_property_readonly("position", &NativeCandidateState::position)
-      .def_property_readonly("positions", &NativeCandidateState::positions);
+      .def_property_readonly("positions", &NativeCandidateState::positions)
+      .def_property_readonly("worker_count",
+                             &NativeCandidateState::worker_count);
   m.attr("candidate_abi_version") = py::int_(1);
 }

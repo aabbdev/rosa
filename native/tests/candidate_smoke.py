@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import gc
+import os
+import threading
 import weakref
+from concurrent.futures import ThreadPoolExecutor
 from itertools import product
 
 import numpy as np
@@ -66,6 +69,69 @@ def compare(tokens: torch.Tensor, suffix_k: int, occurrences_r: int) -> None:
 
 def main() -> None:
     assert rosa_native_step.candidate_abi_version == 1
+
+    # Pools are lazy, never useful below the prefill threshold, and invalid
+    # thread limits (including signed strings) select the serial fallback.
+    small_pool = rosa_native_step.NativeCandidateState(init_candidate_state(3, 4))
+    assert small_pool.worker_count == 0
+    small_pool.prefill(np.zeros((3, 4), dtype=np.int64))
+    assert small_pool.worker_count == 0
+
+    previous_threads = os.environ.get("ROSA_NATIVE_THREADS")
+    os.environ["ROSA_NATIVE_THREADS"] = "-2"
+    try:
+        invalid_limit_pool = rosa_native_step.NativeCandidateState(
+            init_candidate_state(16, 4)
+        )
+        assert invalid_limit_pool.worker_count == 0
+        invalid_limit_pool.prefill(np.zeros((16, 4), dtype=np.int64))
+        assert invalid_limit_pool.worker_count == 0
+    finally:
+        if previous_threads is None:
+            os.environ.pop("ROSA_NATIVE_THREADS", None)
+        else:
+            os.environ["ROSA_NATIVE_THREADS"] = previous_threads
+
+    ragged_pool = rosa_native_step.NativeCandidateState(
+        init_candidate_state(16, 4, ragged=True)
+    )
+    ragged_pool.step_masked(
+        np.zeros(16, dtype=np.int64),
+        np.ones(16, dtype=np.bool_),
+        np.zeros(16, dtype=np.bool_),
+    )
+    assert ragged_pool.worker_count == 0
+
+    # Concurrent mutators serialize while the GIL is released; publication of
+    # position remains atomic from Python's perspective.
+    concurrent_state = init_candidate_state(4, 8)
+    concurrent_native = rosa_native_step.NativeCandidateState(concurrent_state)
+    repeated = np.arange(4, dtype=np.int64)
+    sequential_state = init_candidate_state(4, 8)
+    sequential_native = rosa_native_step.NativeCandidateState(sequential_state)
+    expected_steps = [sequential_native.step(repeated) for _ in range(2)]
+    started = threading.Barrier(3)
+
+    def concurrent_step() -> tuple[np.ndarray, ...]:
+        started.wait()
+        return concurrent_native.step(repeated)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(concurrent_step) for _ in range(2)]
+        started.wait()
+        actual_steps = [future.result() for future in futures]
+    assert concurrent_native.position == concurrent_state.position == 2
+    assert all(
+        any(
+            all(
+                np.array_equal(actual, expected)
+                for actual, expected in zip(step, candidate, strict=True)
+            )
+            for candidate in expected_steps
+        )
+        for step in actual_steps
+    )
+
     binary = torch.tensor(list(product(range(2), repeat=9)), dtype=torch.long)
     for suffix_k, occurrences_r in ((1, 1), (2, 3), (4, 2), (5, 4)):
         compare(binary, suffix_k, occurrences_r)

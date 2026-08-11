@@ -56,6 +56,30 @@ un vecteur NumPy C-contigu `int64` et renvoie le tuple bas niveau
 `(source, match_length, state_id, frequency, count)`. `reset()` recycle tout le
 batch en temps proportionnel aux états et slots de hachage réellement occupés.
 
+Chaque état natif crée à la demande un petit pool C++17 persistant, sans
+dépendance, qui parallélise les lignes indépendantes des prefill top-1 et
+riches. Les prefills
+conservent aussi leur chemin série pour les batchs inférieurs à 4, où le réveil d'un
+worker coûte plus cher que le calcul mesuré. Les steps uniformes ne l'emploient
+qu'à partir d'un batch de 64 afin de conserver le
+chemin série peu coûteux des petits batchs. Le pool est limité par le batch, le
+nombre de CPU annoncé et 16 threads; `ROSA_NATIVE_THREADS=1` force le chemin
+série, et une valeur entière positive fixe une limite plus basse. Une valeur
+absente sélectionne automatiquement la limite disponible, tandis qu'une valeur
+invalide retombe prudemment à un thread. Seules les chaînes non vides composées
+exclusivement de chiffres et représentant une valeur strictement positive sont
+acceptées.
+
+Le pool par état évite le cycle de vie fragile d'un singleton d'extension et
+n'appelle jamais Python depuis ses workers. Aucun worker n'est donc créé pour
+un état ragged ni pour un batch inférieur à 4 qui n'utilise jamais de prefill.
+Son coût éventuel est la création d'au plus 15 threads au premier appel assez
+grand; ils sont réutilisés jusqu'à sa destruction. Les appels mutateurs
+concurrents sur une même instance sont
+sérialisés par un mutex acquis GIL libéré, sans modifier les allocations ni les
+tableaux de sortie publics. Les exceptions C++ des workers sont capturées puis
+relancées sur le thread appelant.
+
 ## Construction locale isolée
 
 Le backend PEP 517 est setuptools, avec pybind11 uniquement comme dépendance de
