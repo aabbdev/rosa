@@ -283,6 +283,14 @@ class TestHelpers(unittest.TestCase):
 
         signature = _soft_match_signature(st1, st2, source, mask, 3)
 
+        def succeed(*args: torch.Tensor) -> torch.Tensor:
+            return _soft_match_torch(*args, window=3)
+
+        rosa._SOFT_MATCH_COMPILED[3] = succeed
+        rosa._SOFT_MATCH_COMPILE_READY.add(signature)
+        cached = _soft_match(st1, st2, source, mask, window=3)
+        self.assertTrue(torch.equal(cached, expected))
+
         def fail(*args: torch.Tensor) -> torch.Tensor:
             raise RuntimeError("cached specialization failed")
 
