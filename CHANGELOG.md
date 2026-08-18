@@ -30,7 +30,8 @@ semantic versioning while it remains in the 0.x development series.
 - The public `rosa` imports and existing stateful inference APIs are unchanged.
 - The distribution remains `rosa-torch` and supports Python 3.10+.
 - The optional `rosa-torch-native 0.3.0` companion remains separately versioned
-  and requires `rosa-torch[numba]>=0.3,<0.4`.
+  and requires `rosa-torch>=0.3,<0.4` plus NumPy. The Numba extra remains
+  optional for suffix-automaton and rich-candidate integration.
 
 ## 0.2.0 — 2026-08-11
 
