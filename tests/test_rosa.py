@@ -343,6 +343,58 @@ class TestHelpers(unittest.TestCase):
         signature = _soft_match_signature(st1, st2, source, mask, 3)
         self.assertIn(signature, rosa._SOFT_MATCH_COMPILE_READY)
 
+    def test_soft_match_waiter_reuses_newly_ready_specialization(self) -> None:
+        _clear_soft_match_compile_cache()
+        st1 = torch.softmax(torch.randn(1, 5, 3), dim=-1)
+        st2 = torch.softmax(torch.randn(1, 5, 2), dim=-1)
+        source = torch.randint(-1, 5, (1, 5, 4))
+        mask = source >= 0
+        signature = _soft_match_signature(st1, st2, source, mask, 3)
+        compiled_started = threading.Event()
+        second_waiting = threading.Event()
+        release_compiled = threading.Event()
+
+        class SignalingLock:
+            def __init__(self) -> None:
+                self._lock = threading.Lock()
+                self._count_lock = threading.Lock()
+                self._entries = 0
+
+            def __enter__(self) -> None:
+                with self._count_lock:
+                    self._entries += 1
+                    if self._entries == 2:
+                        second_waiting.set()
+                self._lock.acquire()
+
+            def __exit__(self, *args: object) -> None:
+                self._lock.release()
+
+        rosa._SOFT_MATCH_SIGNATURE_LOCKS[signature] = SignalingLock()
+
+        def compiled(*args: torch.Tensor) -> torch.Tensor:
+            compiled_started.set()
+            if not release_compiled.wait(timeout=5):
+                raise RuntimeError("timed out waiting for concurrent caller")
+            return _soft_match_torch(*args, window=3)
+
+        with (
+            patch("rosa.torch.compile", return_value=compiled) as compile_mock,
+            ThreadPoolExecutor(max_workers=2) as executor,
+        ):
+            first = executor.submit(_soft_match, st1, st2, source, mask, 3)
+            self.assertTrue(compiled_started.wait(timeout=5))
+            second = executor.submit(_soft_match, st1, st2, source, mask, 3)
+            try:
+                self.assertTrue(second_waiting.wait(timeout=5))
+            finally:
+                release_compiled.set()
+            first_result = first.result()
+            second_result = second.result()
+
+        self.assertEqual(compile_mock.call_count, 1)
+        self.assertTrue(torch.equal(first_result, second_result))
+
     def test_soft_match_failure_does_not_poison_other_signature(self) -> None:
         _clear_soft_match_compile_cache()
         calls: list[tuple[int, ...]] = []
