@@ -25,6 +25,80 @@ namespace {
 
 constexpr size_t kMaximumNativeThreads = 16;
 
+uint32_t leading_zero_count64(uint64_t value) noexcept {
+  if (value == 0)
+    return 64;
+#if defined(_MSC_VER)
+  uint32_t count = 0;
+  if ((value & UINT64_C(0xffffffff00000000)) == 0) {
+    count += 32;
+    value <<= 32;
+  }
+  if ((value & UINT64_C(0xffff000000000000)) == 0) {
+    count += 16;
+    value <<= 16;
+  }
+  if ((value & UINT64_C(0xff00000000000000)) == 0) {
+    count += 8;
+    value <<= 8;
+  }
+  if ((value & UINT64_C(0xf000000000000000)) == 0) {
+    count += 4;
+    value <<= 4;
+  }
+  if ((value & UINT64_C(0xc000000000000000)) == 0) {
+    count += 2;
+    value <<= 2;
+  }
+  return count + ((value & UINT64_C(0x8000000000000000)) == 0 ? 1 : 0);
+#else
+  return static_cast<uint32_t>(__builtin_clzll(value));
+#endif
+}
+
+uint32_t trailing_zero_count64(uint64_t value) noexcept {
+  if (value == 0)
+    return 64;
+#if defined(_MSC_VER)
+  uint32_t count = 0;
+  if ((value & UINT64_C(0x00000000ffffffff)) == 0) {
+    count += 32;
+    value >>= 32;
+  }
+  if ((value & UINT64_C(0x000000000000ffff)) == 0) {
+    count += 16;
+    value >>= 16;
+  }
+  if ((value & UINT64_C(0x00000000000000ff)) == 0) {
+    count += 8;
+    value >>= 8;
+  }
+  if ((value & UINT64_C(0x000000000000000f)) == 0) {
+    count += 4;
+    value >>= 4;
+  }
+  if ((value & UINT64_C(0x0000000000000003)) == 0) {
+    count += 2;
+    value >>= 2;
+  }
+  return count + ((value & UINT64_C(0x1)) == 0 ? 1 : 0);
+#else
+  return static_cast<uint32_t>(__builtin_ctzll(value));
+#endif
+}
+
+uint32_t population_count64(uint64_t value) noexcept {
+#if defined(_MSC_VER)
+  value -= (value >> 1) & UINT64_C(0x5555555555555555);
+  value = (value & UINT64_C(0x3333333333333333)) +
+          ((value >> 2) & UINT64_C(0x3333333333333333));
+  value = (value + (value >> 4)) & UINT64_C(0x0f0f0f0f0f0f0f0f);
+  return static_cast<uint32_t>((value * UINT64_C(0x0101010101010101)) >> 56);
+#else
+  return static_cast<uint32_t>(__builtin_popcountll(value));
+#endif
+}
+
 size_t native_thread_count(int64_t rows) {
   if (rows <= 1)
     return 1;
@@ -2291,7 +2365,8 @@ private:
             matched += kChunkCodes;
             continue;
           }
-          return matched + static_cast<size_t>(__builtin_clzll(difference) / 4);
+          return matched +
+                 static_cast<size_t>(leading_zero_count64(difference) / 4);
         }
         size_t edge = contiguous;
         while (edge != 0) {
@@ -3342,7 +3417,7 @@ private:
     }
 
     static uint32_t popcount64(uint64_t value) noexcept {
-      return static_cast<uint32_t>(__builtin_popcountll(value));
+      return population_count64(value);
     }
     static size_t compact_histogram_rank(const Leaf &leaf,
                                          uint32_t code) noexcept {
@@ -3477,7 +3552,7 @@ private:
       for (uint32_t word_index = 0; word_index < 4; ++word_index) {
         uint64_t word = leaf.histogram_bitmap[word_index];
         while (word != 0) {
-          const uint32_t bit = static_cast<uint32_t>(__builtin_ctzll(word));
+          const uint32_t bit = trailing_zero_count64(word);
           const uint32_t code = word_index * 64u + bit;
           histogram_set(result, index++, code,
                         leaf_histogram_count(leaf, code, source_width),
@@ -4215,7 +4290,7 @@ private:
       for (uint32_t word_index = 0; word_index < 4; ++word_index) {
         uint64_t word = leaf.histogram_bitmap[word_index];
         while (word != 0) {
-          const uint32_t bit = static_cast<uint32_t>(__builtin_ctzll(word));
+          const uint32_t bit = trailing_zero_count64(word);
           const uint32_t code = word_index * 64u + bit;
           add_histogram_entry(destination, code,
                               leaf_histogram_count(leaf, code, width), width);

@@ -92,13 +92,15 @@ For the lowest CPU step latency, install the optional native companion. Wheels
 are published separately for each supported platform and Python ABI:
 
 ```bash
-uv add rosa-torch-native
+uv add 'rosa-torch[numba]' rosa-torch-native
 ```
 
 The native sources remain available from the Git repository and are not
 included in the pure-Python `rosa-torch` source distribution.
 
 The stateful backend detects it lazily and otherwise falls back to Numba.
+The native RLBWT backends require only the base package and NumPy; the Numba
+extra enables the native suffix-automaton and rich-candidate integration.
 
 Install the package and its locked development dependencies with [uv](https://docs.astral.sh/uv/):
 

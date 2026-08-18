@@ -9,8 +9,10 @@ main Python package.
 The C++ core implements the validated exact production state machine. It binds
 the NumPy arrays of a `_StatefulInferenceState` once, updates them in place,
 and releases the GIL during computation. It neither includes nor calls
-libtorch. The runtime dependency `rosa-torch[numba]>=0.3,<0.4` provides the
-compatible state contract together with PyTorch, NumPy, and Numba.
+libtorch. The runtime dependencies `rosa-torch>=0.3,<0.4` and NumPy provide the
+compatible tensor and array contracts. Install the `rosa-torch[numba]` extra
+to enable the native suffix-automaton and rich-candidate integration; the
+native RLBWT backends do not require Numba.
 
 The constructor validates every shape, dtype, counter, and ABI version before
 retaining any pointer. The current native state ABI is `1`.
@@ -47,7 +49,7 @@ wheel does not provide a newer optional method.
 Install the matching wheel for the current platform and Python ABI from PyPI:
 
 ```bash
-uv add rosa-torch-native
+uv add 'rosa-torch[numba]' rosa-torch-native
 ```
 
 `rosa-torch` detects the extension automatically from its Numba inference
