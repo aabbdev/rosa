@@ -1378,7 +1378,16 @@ class ROSA(nn.Module):
         )
 
 
-InferenceBackend = Literal["auto", "python", "numba"]
+InferenceBackend = Literal[
+    "auto",
+    "python",
+    "numba",
+    "rlbwt",
+    "rlbwt_native",
+    "rlbwt_compact256",
+    "rlbwt_mc128",
+    "rlbwt_mc192",
+]
 InferenceMode = Literal["top1", "rich"]
 
 
@@ -1404,7 +1413,15 @@ class ROSAInferenceState:
 
     batch_size: int
     max_length: int
-    backend: Literal["python", "numba"]
+    backend: Literal[
+        "python",
+        "numba",
+        "rlbwt",
+        "rlbwt_native",
+        "rlbwt_compact256",
+        "rlbwt_mc128",
+        "rlbwt_mc192",
+    ]
     mode: InferenceMode
     ragged: bool
     suffix_k: int
@@ -1471,7 +1488,15 @@ class ROSAInferenceState:
 def _make_inference_impl(
     batch_size: int,
     max_length: int,
-    backend: Literal["python", "numba"],
+    backend: Literal[
+        "python",
+        "numba",
+        "rlbwt",
+        "rlbwt_native",
+        "rlbwt_compact256",
+        "rlbwt_mc128",
+        "rlbwt_mc192",
+    ],
     mode: InferenceMode = "top1",
     ragged: bool = False,
     suffix_k: int = 16,
@@ -1506,6 +1531,26 @@ def _make_inference_impl(
         return init_ragged_state(batch_size, max_length)
     if backend == "python":
         return _init_python_inference_state(batch_size, max_length)
+    if backend == "rlbwt":
+        from ._rlbwt_backend import _init_rlbwt_state
+
+        return _init_rlbwt_state(batch_size, max_length)
+    if backend == "rlbwt_native":
+        from ._rlbwt_backend import _init_native_rlbwt_state
+
+        return _init_native_rlbwt_state(batch_size, max_length)
+    if backend == "rlbwt_compact256":
+        from ._rlbwt_backend import _init_native_rlbwt_compact_state
+
+        return _init_native_rlbwt_compact_state(batch_size, max_length)
+    if backend in {"rlbwt_mc128", "rlbwt_mc192"}:
+        from ._rlbwt_backend import _init_native_rlbwt_mc_state
+
+        return _init_native_rlbwt_mc_state(
+            batch_size,
+            max_length,
+            2 if backend == "rlbwt_mc128" else 3,
+        )
     try:
         from ._stateful_numba import _init_inference_state
     except ModuleNotFoundError as error:
@@ -1625,19 +1670,46 @@ def init_inference_state(
         raise ValueError("batch_size must be > 0")
     if max_length <= 0:
         raise ValueError("max_length must be > 0")
-    if backend not in {"auto", "python", "numba"}:
-        raise ValueError("backend must be 'auto', 'python', or 'numba'")
+    if backend not in {
+        "auto",
+        "python",
+        "numba",
+        "rlbwt",
+        "rlbwt_native",
+        "rlbwt_compact256",
+        "rlbwt_mc128",
+        "rlbwt_mc192",
+    }:
+        raise ValueError(
+            "backend must be 'auto', 'python', 'numba', 'rlbwt', "
+            "'rlbwt_native', 'rlbwt_compact256', 'rlbwt_mc128', or 'rlbwt_mc192'"
+        )
     if mode not in {"top1", "rich"}:
         raise ValueError("mode must be 'top1' or 'rich'")
     if suffix_k <= 0:
         raise ValueError("suffix_k must be > 0")
     if occurrences_r <= 0:
         raise ValueError("occurrences_r must be > 0")
-    if (mode == "rich" or ragged) and backend == "python":
+    if (mode == "rich" or ragged) and backend in {
+        "python",
+        "rlbwt",
+        "rlbwt_native",
+        "rlbwt_compact256",
+        "rlbwt_mc128",
+        "rlbwt_mc192",
+    }:
         feature = "rich" if mode == "rich" else "ragged"
-        raise ValueError(f"{feature} inference does not support backend='python'")
+        raise ValueError(f"{feature} inference does not support backend={backend!r}")
 
-    selected: Literal["python", "numba"]
+    selected: Literal[
+        "python",
+        "numba",
+        "rlbwt",
+        "rlbwt_native",
+        "rlbwt_compact256",
+        "rlbwt_mc128",
+        "rlbwt_mc192",
+    ]
     if backend == "auto":
         if mode == "rich" or ragged:
             selected = "numba"
@@ -1750,6 +1822,18 @@ def _inference_step(
         output = cast(Any, state._impl).step(token, active=active, reset=reset)
     elif state.backend == "python":
         output = _python_forward_step(cast(_PythonInferenceState, state._impl), token)
+    elif state.backend == "rlbwt":
+        from ._rlbwt_backend import _forward_step as rlbwt_step
+
+        output = rlbwt_step(cast(Any, state._impl), token)
+    elif state.backend == "rlbwt_compact256":
+        from ._rlbwt_backend import _compact_forward_step
+
+        output = _compact_forward_step(cast(Any, state._impl), token)
+    elif state.backend in {"rlbwt_native", "rlbwt_mc128", "rlbwt_mc192"}:
+        from ._rlbwt_backend import _native_forward_step
+
+        output = _native_forward_step(cast(Any, state._impl), token)
     else:
         from ._stateful_numba import _forward_step
 
@@ -1868,6 +1952,26 @@ def _inference_prefill(state: ROSAInferenceState, tokens: Tensor) -> InferenceOu
                 ],
                 dim=1,
             )
+    elif state.mode == "top1" and not state.ragged and state.backend == "rlbwt":
+        from ._rlbwt_backend import _prefill as rlbwt_prefill
+
+        output = rlbwt_prefill(cast(Any, state._impl), tokens)
+    elif (
+        state.mode == "top1"
+        and not state.ragged
+        and state.backend == "rlbwt_compact256"
+    ):
+        from ._rlbwt_backend import _compact_prefill
+
+        output = _compact_prefill(cast(Any, state._impl), tokens)
+    elif (
+        state.mode == "top1"
+        and not state.ragged
+        and state.backend in {"rlbwt_native", "rlbwt_mc128", "rlbwt_mc192"}
+    ):
+        from ._rlbwt_backend import _native_prefill
+
+        output = _native_prefill(cast(Any, state._impl), tokens)
     elif state.mode == "top1" and not state.ragged:
         from ._stateful_numba import _prefill
 

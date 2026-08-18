@@ -171,6 +171,12 @@ for token in generated_token_ids:  # each tensor has shape [2]
 state.reset()
 ```
 
+Experimental top-1 RLBWT backends are also available: `rlbwt` is the Python
+oracle, `rlbwt_native` is the exact fused implementation, and
+`rlbwt_compact256` is optimized for externally encoded IDs in `[0, 255]`.
+`rlbwt_mc128` and `rlbwt_mc192` provide explicitly opt-in Monte-Carlo LCEs.
+These backends are uniform-only and are never selected by `backend="auto"`.
+
 Capacity is fixed at initialization for predictable memory use. Exceeding it
 raises `RuntimeError` before mutation. States are mutable, isolated, and must
 not be shared concurrently between decoding requests. `forward_step` implements
