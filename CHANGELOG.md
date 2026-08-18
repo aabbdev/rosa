@@ -3,6 +3,34 @@
 All notable changes to `rosa-torch` are documented here. The project follows
 semantic versioning while it remains in the 0.x development series.
 
+## 0.3.0 — 2026-08-18
+
+### Added
+
+- Exact online RLBWT inference backends for top-1 dense workloads, including a
+  Python semantic oracle and optional fused native implementations.
+- Compact exact `rlbwt_compact256` storage for long contexts with adaptive
+  leaves, packed position arrays, and bounded owned memory.
+- Explicit opt-in Monte-Carlo RLBWT variants with independently seeded suffix
+  fingerprints and clearly separated backend names.
+- Native RLBWT smoke tests covering prefill, continuation, reset, compact token
+  validation, and agreement with the exact Python oracle.
+
+### Changed
+
+- Reworked native RLBWT storage around unified cache-sized leaves and adaptive
+  representations for BWT, position, and longest-common-suffix data.
+- Allocated long-context history and tree arenas lazily from live length rather
+  than configured capacity.
+- Kept `backend="auto"` on the production suffix-automaton path; all RLBWT
+  backends remain explicit opt-in choices.
+
+### Compatibility
+
+- The public `rosa` imports and existing stateful inference APIs are unchanged.
+- The distribution remains `rosa-torch` and supports Python 3.10+.
+- The optional native companion remains separately versioned and optional.
+
 ## 0.2.0 — 2026-08-11
 
 ### Added
