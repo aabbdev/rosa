@@ -38,23 +38,23 @@ The design avoids a trainable dense automaton transition tensor and avoids dense
 - Optional shape-specialized `torch.compile` soft-match acceleration.
 - 100% statement and branch coverage for the `rosa` package.
 
-## What's new in 0.2.0
+## What's new in 0.3.0
 
-Version 0.2.0 turns the original differentiable prototype into a unified
-training and inference package:
+Version 0.3.0 adds exact long-context RLBWT inference while preserving the
+unified training and inference API introduced in 0.2.0:
 
-- exact stateful inference now scales with amortized `O(log N)` suffix-path
-  updates instead of eager linear propagation;
-- one facade covers top-1 and rich candidates, dense and ragged batches,
-  prefill, continuation, reset, and row recycling;
-- the optional native companion accelerates rich/top-1 prefill, parallel batch
-  work, and caller-owned `step_into` buffers while retaining exact fallbacks;
-- `ROSA.forward` uses fused rich candidate prefill and preserves the independent
-  Python oracle;
-- projections are performed before candidate gather, and an opt-in compiled
-  soft-match island accelerates warmed fixed-shape training workloads.
+- `backend="rlbwt"` provides a Python semantic oracle for exact online top-1
+  retrieval;
+- `backend="rlbwt_native"` fuses the same state machine in the optional C++
+  companion;
+- `backend="rlbwt_compact256"` adds compact exact storage for vocabularies up
+  to 256 IDs and very long configured contexts;
+- explicit `rlbwt_mc128` and `rlbwt_mc192` variants offer opt-in probabilistic
+  acceleration without changing exact `auto` dispatch;
+- lazy arenas and adaptive packed storage keep allocation tied to live context
+  length rather than maximum capacity.
 
-See the [changelog](https://github.com/aabbdev/rosa/blob/v0.2.0/CHANGELOG.md)
+See the [changelog](https://github.com/aabbdev/rosa/blob/v0.3.0/CHANGELOG.md)
 for compatibility notes and the complete release summary.
 
 ## Core scoring rule

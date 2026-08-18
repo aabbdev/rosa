@@ -198,10 +198,20 @@ class TestRLBWTBackend(unittest.TestCase):
 
     def test_native_dispatch_with_capability_stub(self) -> None:
         class StubNativeRLBWTState:
-            def __init__(self, batch_size: int, max_length: int) -> None:
+            def __init__(
+                self,
+                batch_size: int,
+                max_length: int,
+                vocabulary_size: int | None = None,
+                lanes: int | None = None,
+                seed: int | None = None,
+            ) -> None:
                 self.batch_size = batch_size
                 self.max_length = max_length
                 self.position = 0
+                self.vocabulary_size = vocabulary_size
+                self.lanes = lanes
+                self.seed = seed
 
             def step(self, tokens: np.ndarray) -> np.ndarray:
                 self.position += 1
@@ -211,8 +221,19 @@ class TestRLBWTBackend(unittest.TestCase):
                 self.position = tokens.shape[1]
                 return tokens.copy()
 
+        class StubNativeRLBWTStateMC(StubNativeRLBWTState):
+            def __init__(
+                self, batch_size: int, max_length: int, lanes: int, seed: int
+            ) -> None:
+                super().__init__(batch_size, max_length, lanes=lanes, seed=seed)
+
         capability = SimpleNamespace(
-            rlbwt_abi_version=1, NativeRLBWTState=StubNativeRLBWTState
+            rlbwt_abi_version=1,
+            NativeRLBWTState=StubNativeRLBWTState,
+            rlbwt_compact_abi_version=1,
+            NativeRLBWTCompactState=StubNativeRLBWTState,
+            rlbwt_mc_abi_version=1,
+            NativeRLBWTStateMC=StubNativeRLBWTStateMC,
         )
         with patch.dict("sys.modules", {"rosa_native_step": capability}):
             state = init_inference_state(2, 3, backend="rlbwt_native")
@@ -229,6 +250,23 @@ class TestRLBWTBackend(unittest.TestCase):
             self.assertEqual(
                 tuple(prefill(empty, torch.empty(0, dtype=torch.long)).shape), (0,)
             )
+
+            compact = init_inference_state(1, 3, backend="rlbwt_compact256")
+            self.assertEqual(compact._impl.vocabulary_size, 256)
+            compact_tokens = torch.tensor([[0, 255]])
+            self.assertTrue(
+                torch.equal(prefill(compact, compact_tokens), compact_tokens)
+            )
+            compact.reset()
+            self.assertEqual(forward_step(compact, torch.tensor([7])).item(), 7)
+            with self.assertRaisesRegex(ValueError, r"\[0, 255\]"):
+                forward_step(compact, torch.tensor([256]))
+
+            for backend, lanes in (("rlbwt_mc128", 2), ("rlbwt_mc192", 3)):
+                mc = init_inference_state(1, 2, backend=backend)
+                self.assertEqual(mc._impl.lanes, lanes)
+                self.assertEqual(mc._impl.seed, 20260811)
+                self.assertEqual(prefill(mc, torch.tensor([[5]])).item(), 5)
 
     def test_native_backend_matches_python_oracle_when_available(self) -> None:
         try:

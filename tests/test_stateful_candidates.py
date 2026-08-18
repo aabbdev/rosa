@@ -143,6 +143,85 @@ class TestStatefulCandidates(unittest.TestCase):
                 )
             )
 
+    def test_allocating_native_dispatch_paths(self) -> None:
+        def outputs(
+            state: CandidateState, sequence_length: int | None = None
+        ) -> tuple[np.ndarray, ...]:
+            slots = state.suffix_k * state.occurrences_r
+            prefix = (
+                (state.batch_size,)
+                if sequence_length is None
+                else (state.batch_size, sequence_length)
+            )
+            shape = (*prefix, slots)
+            return (
+                np.full(shape, -1, dtype=np.int64),
+                np.zeros(shape, dtype=np.int64),
+                np.full(shape, -1, dtype=np.int64),
+                np.zeros(shape, dtype=np.int64),
+                np.zeros(prefix, dtype=np.int32),
+            )
+
+        uniform = init_candidate_state(2, 2, suffix_k=2, occurrences_r=2)
+
+        def native_step(
+            state: CandidateState, tokens: torch.Tensor
+        ) -> tuple[np.ndarray, ...]:
+            state.position += 1
+            return outputs(state)
+
+        with patch(
+            "rosa._stateful_candidates_numba._native_candidate_step",
+            side_effect=native_step,
+        ):
+            result = forward_candidates_step(uniform, torch.tensor([1, 2]))
+        self.assertFalse(bool(result.mask.any()))
+        self.assertEqual(uniform.positions.tolist(), [1, 1])
+
+        ragged = init_candidate_state_internal(
+            2, 2, suffix_k=2, occurrences_r=2, ragged=True
+        )
+
+        def native_masked(
+            state: CandidateState, method: str, *arrays: np.ndarray
+        ) -> tuple[np.ndarray, ...] | None:
+            self.assertEqual(method, "step_masked")
+            active = arrays[1].astype(bool)
+            reset = arrays[2].astype(bool)
+            state.positions[np.logical_and(active, reset)] = 0
+            state.positions[active] += 1
+            return outputs(state)
+
+        with patch(
+            "rosa._stateful_candidates_numba._native_candidate_call",
+            side_effect=native_masked,
+        ):
+            result = forward_candidates_step_masked(
+                ragged,
+                torch.tensor([1, 2]),
+                torch.tensor([True, False]),
+                torch.tensor([True, False]),
+            )
+        self.assertFalse(bool(result.mask.any()))
+        self.assertEqual(ragged.positions.tolist(), [1, 0])
+
+        prefilled = init_candidate_state(2, 2, suffix_k=2, occurrences_r=2)
+
+        def native_prefill(
+            state: CandidateState, method: str, tokens: np.ndarray
+        ) -> tuple[np.ndarray, ...]:
+            self.assertEqual(method, "prefill")
+            state.position = tokens.shape[1]
+            return outputs(state, tokens.shape[1])
+
+        with patch(
+            "rosa._stateful_candidates_numba._native_candidate_call",
+            side_effect=native_prefill,
+        ):
+            result = prefill_candidates(prefilled, torch.tensor([[1, 2], [3, 4]]))
+        self.assertFalse(bool(result.mask.any()))
+        self.assertEqual(prefilled.positions.tolist(), [2, 2])
+
     def test_caller_owned_step_and_prefill_buffers_are_exact(self) -> None:
         tokens = torch.tensor([[0, 1, 0, 2], [3, 3, 4, 3]])
         state = init_candidate_state(2, 4, suffix_k=3, occurrences_r=2)
