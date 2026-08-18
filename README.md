@@ -88,20 +88,15 @@ Install the stateful Link-Cut Tree backend with:
 uv add 'rosa-torch[numba]'
 ```
 
-For the lowest CPU step latency, build and install the optional native companion
-locally. `rosa-torch-native` is not currently published on PyPI because it
-requires per-platform and per-Python ABI wheels:
+For the lowest CPU step latency, install the optional native companion. Wheels
+are published separately for each supported platform and Python ABI:
 
 ```bash
-git clone https://github.com/aabbdev/rosa.git
-cd rosa
-uv sync --extra numba
-uv build --wheel native --out-dir native/dist
-uv pip install native/dist/rosa_torch_native-0.2.0-*.whl
+uv add rosa-torch-native
 ```
 
-The native sources are available from the Git repository and are not included
-in the pure-Python `rosa-torch` source distribution on PyPI.
+The native sources remain available from the Git repository and are not
+included in the pure-Python `rosa-torch` source distribution.
 
 The stateful backend detects it lazily and otherwise falls back to Numba.
 

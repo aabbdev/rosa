@@ -9,11 +9,18 @@ main Python package.
 The C++ core implements the validated exact production state machine. It binds
 the NumPy arrays of a `_StatefulInferenceState` once, updates them in place,
 and releases the GIL during computation. It neither includes nor calls
-libtorch. The runtime dependency `rosa-torch[numba]>=0.2,<0.3` provides the
+libtorch. The runtime dependency `rosa-torch[numba]>=0.3,<0.4` provides the
 compatible state contract together with PyTorch, NumPy, and Numba.
 
 The constructor validates every shape, dtype, counter, and ABI version before
 retaining any pointer. The current native state ABI is `1`.
+
+The module also provides fused online RLBWT inference for exact dense top-1
+retrieval. `NativeRLBWTState` is the explicit baseline,
+`NativeRLBWTCompactState` stores vocabularies of at most 256 IDs in adaptive
+packed leaves, and `NativeRLBWTStateMC` exposes the separately named opt-in
+Monte-Carlo variants. The Python package keeps these backends explicit;
+`backend="auto"` continues to select the production suffix-automaton path.
 
 The module also exposes `NativeCandidateState` for the exact rich state in
 `rosa._stateful_candidates_numba`. Its batched `step` maintains the same K
@@ -37,17 +44,10 @@ wheel does not provide a newer optional method.
 
 ## Installation and usage
 
-`rosa-torch-native` is not currently published on PyPI. Build a wheel from a
-Git checkout using the target Python interpreter, then install the matching
-wheel for the current platform and ABI:
+Install the matching wheel for the current platform and Python ABI from PyPI:
 
 ```bash
-git clone https://github.com/aabbdev/rosa.git
-cd rosa
-uv sync --extra numba
-uv build --python .venv/bin/python --wheel native --out-dir native/dist
-uv pip install --python .venv/bin/python \
-  native/dist/rosa_torch_native-0.2.0-*.whl
+uv add rosa-torch-native
 ```
 
 `rosa-torch` detects the extension automatically from its Numba inference
@@ -102,7 +102,7 @@ uv build --python .venv/bin/python --wheel native \
   --out-dir /tmp/rosa-native-dist
 uv run --isolated \
   --with '.[numba]' \
-  --with /tmp/rosa-native-dist/rosa_torch_native-0.2.0-*.whl \
+  --with /tmp/rosa-native-dist/rosa_torch_native-0.3.0-*.whl \
   native/tests/smoke.py
 ```
 
@@ -115,8 +115,8 @@ respectively, in the same isolated environment.
 
 ## Multi-platform publication
 
-The next publication step is a dedicated `cibuildwheel` workflow after defining
-the supported Python and architecture matrix, manylinux targets, and release
-policy. No such workflow is included yet because an unvalidated matrix must not
-be published. Every wheel contains native code and must be built separately for
-each Python ABI and platform.
+The release workflow builds CPython 3.10–3.14 wheels for Linux x86-64, macOS
+arm64, and Windows x64, plus CPython 3.10–3.12 wheels for macOS x86-64. Each
+wheel is smoke-tested by importing the extension and checking its production
+and compact RLBWT ABI versions before it is attached to the GitHub Release and
+published through PyPI Trusted Publishing.

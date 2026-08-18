@@ -8,11 +8,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rosa-torch-native"
-version = "0.2.0"
-description = "Optional native CPU step companion for rosa-torch"
+version = "0.3.0"
+description = "Optional native CPU inference companion for rosa-torch"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
+license-files = ["LICENSE"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Programming Language :: C++",
@@ -25,7 +26,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "rosa-torch[numba]>=0.2,<0.3",
+    "rosa-torch[numba]>=0.3,<0.4",
 ]
 
 [project.urls]
@@ -34,3 +35,8 @@ Issues = "https://github.com/aabbdev/rosa/issues"
 
 [tool.setuptools]
 include-package-data = false
+
+[tool.cibuildwheel]
+build = ["cp310-*", "cp311-*", "cp312-*", "cp313-*", "cp314-*"]
+skip = ["*-musllinux_*", "*-manylinux_i686", "*-win32"]
+test-command = "python -c \"import rosa_native_step as native; assert native.candidate_abi_version == 1; assert native.rlbwt_compact_abi_version == 1\""
