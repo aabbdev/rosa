@@ -1,0 +1,166 @@
+name: Publish native companion
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate native release
+    if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'native-v') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Match release tag to package version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import tomllib
+
+          metadata = tomllib.loads(pathlib.Path("native/pyproject.toml").read_text())
+          expected = f"native-v{metadata['project']['version']}"
+          actual = os.environ.get("RELEASE_TAG", "")
+          if actual and actual != expected:
+              raise SystemExit(f"release tag {actual!r} must equal {expected!r}")
+          print(expected)
+          PY
+
+  build:
+    name: Build ${{ matrix.platform }} wheels
+    needs: validate
+    if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'native-v') }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            os: ubuntu-latest
+            arch: x86_64
+            build: cp310-* cp311-* cp312-* cp313-* cp314-*
+          - platform: macos-x86_64
+            os: macos-15-intel
+            arch: x86_64
+            build: cp310-* cp311-* cp312-*
+          - platform: macos-arm64
+            os: macos-15
+            arch: arm64
+            build: cp310-* cp311-* cp312-* cp313-* cp314-*
+          - platform: windows-amd64
+            os: windows-latest
+            arch: AMD64
+            build: cp310-* cp311-* cp312-* cp313-* cp314-*
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@1828c10ab37f080699c7b81cea34097c684a7074 # v4.2.0
+        env:
+          CIBW_ARCHS: ${{ matrix.arch }}
+          CIBW_BUILD: ${{ matrix.build }}
+        with:
+          package-dir: native
+          output-dir: wheelhouse
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-wheels-${{ matrix.platform }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+
+  sdist:
+    name: Build source distribution
+    needs: validate
+    if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'native-v') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.8.15"
+          python-version: "3.10"
+          enable-cache: false
+
+      - name: Build source distribution
+        run: uv build --sdist native --out-dir wheelhouse
+
+      - name: Upload source distribution
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-sdist
+          path: wheelhouse/*.tar.gz
+          if-no-files-found: error
+
+  attach:
+    name: Attach distributions to release
+    needs: [validate, build, sdist]
+    if: ${{ github.event_name == 'release' && startsWith(github.event.release.tag_name, 'native-v') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download wheels
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: native-*
+          path: wheelhouse
+          merge-multiple: true
+
+      - name: Attach wheels
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$RELEASE_TAG" wheelhouse/*
+
+  publish:
+    name: Publish native distributions
+    needs: [validate, build, sdist]
+    if: ${{ github.event_name == 'release' && startsWith(github.event.release.tag_name, 'native-v') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/p/rosa-torch-native
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download wheels
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: native-*
+          path: wheelhouse
+          merge-multiple: true
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: wheelhouse

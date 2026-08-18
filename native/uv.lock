@@ -684,14 +684,14 @@ wheels = [
 
 [[package]]
 name = "rosa-torch"
-version = "0.2.0"
+version = "0.3.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "torch" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/8f/a7/f7fe036ff6f52e49f4a4a1a77abccb111d4545d9bf84e9968d301dc9a8e7/rosa_torch-0.2.0.tar.gz", hash = "sha256:86495aaa5102bcc89573e81386b292231e88493193e40f396838e3086dbfd815", size = 41687, upload-time = "2026-08-11T13:25:33.697Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/46/20/88b88b9b6307f72a2c3892405897efd370c7614abf49489569069ba7340d/rosa_torch-0.3.0.tar.gz", hash = "sha256:19009a36049c994bbc2950d1c9c9f113819f047dccc235a88ccd5d70eb35a677", size = 46505, upload-time = "2026-08-18T13:15:59.421Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/90/43/1ec2e812c6571a374ab1e9b17926ca96d250ffe9b10ad4052c86ad0f35ed/rosa_torch-0.2.0-py3-none-any.whl", hash = "sha256:992b66de7845b5fc3e537c5cf53e1f69aab2fb4b5ea5f292e00c5ea1c583cb10", size = 43645, upload-time = "2026-08-11T13:25:32.114Z" },
+    { url = "https://files.pythonhosted.org/packages/53/bc/5477145f95f309938cd271e48892ca3721a1f425551ed0600f9c005aef3d/rosa_torch-0.3.0-py3-none-any.whl", hash = "sha256:8c143a8cd681ec30ca7783b80254057f750cc371542d35f2504ecf123a3b14a5", size = 48752, upload-time = "2026-08-18T13:15:58.144Z" },
 ]
 
 [package.optional-dependencies]
@@ -701,14 +701,14 @@ numba = [
 
 [[package]]
 name = "rosa-torch-native"
-version = "0.2.0"
+version = "0.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "rosa-torch", extra = ["numba"] },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "rosa-torch", extras = ["numba"], specifier = ">=0.2,<0.3" }]
+requires-dist = [{ name = "rosa-torch", extras = ["numba"], specifier = ">=0.3,<0.4" }]
 
 [[package]]
 name = "setuptools"
