@@ -804,6 +804,206 @@ class TestROSASemantics(unittest.TestCase):
         self.assertEqual(output.candidate_source_index.shape[-1], 1 * 1 + 1 + 1)
         self.assertEqual(calls, 2)
 
+    def test_zero_neural_value_scale_skips_projection_and_reactivates(self) -> None:
+        torch.manual_seed(20260811)
+        model = self.make_model(neural_value_scale=0.0)
+        z = torch.randn(2, 9, 8)
+        positions = torch.tensor([[1, 6], [2, 8]])
+        projection_calls = 0
+
+        def projection_hook(_module, _args, _output) -> None:
+            nonlocal projection_calls
+            projection_calls += 1
+
+        hook = model.value_proj.register_forward_hook(projection_hook)
+        try:
+            for query_positions in (None, positions):
+                with self.subTest(scale=0.0, query_positions=query_positions):
+                    model.zero_grad(set_to_none=True)
+                    with patch.object(
+                        model,
+                        "_candidate_neural_values",
+                        side_effect=AssertionError("unexpected neural values"),
+                    ):
+                        output = model(z, query_positions=query_positions)
+                        output.updated.square().mean().backward()
+                        with torch.no_grad():
+                            model(z, query_positions=query_positions)
+                    for parameter in model.value_proj.parameters():
+                        self.assertIsNotNone(parameter.grad)
+                        assert parameter.grad is not None
+                        self.assertEqual(torch.count_nonzero(parameter.grad).item(), 0)
+            self.assertEqual(projection_calls, 0)
+
+            model.set_neural_value_scale(1.0)
+            for query_positions in (None, positions):
+                with self.subTest(scale=1.0, query_positions=query_positions):
+                    model.zero_grad(set_to_none=True)
+                    output = model(z, query_positions=query_positions)
+                    output.updated.square().mean().backward()
+                    for parameter in model.value_proj.parameters():
+                        self.assertIsNotNone(parameter.grad)
+                        assert parameter.grad is not None
+                        self.assertGreater(float(parameter.grad.abs().sum()), 0.0)
+            self.assertEqual(projection_calls, 2)
+        finally:
+            hook.remove()
+
+    def test_skipped_value_projection_zero_is_numerically_dormant(self) -> None:
+        model = self.make_model(neural_value_scale=0.0).to(dtype=torch.bfloat16)
+        symbolic = torch.randn(2, 3, 4, 8, dtype=torch.bfloat16)
+
+        for corruption in ("maximum", "non_finite"):
+            with self.subTest(corruption=corruption), torch.no_grad():
+                model.value_proj.weight.fill_(torch.finfo(torch.bfloat16).max)
+                if corruption == "non_finite":
+                    flat_weight = model.value_proj.weight.reshape(-1)
+                    flat_weight[0] = torch.nan
+                    flat_weight[1] = torch.inf
+                    flat_weight[2] = -torch.inf
+            model.zero_grad(set_to_none=True)
+            candidate_value = model._attach_skipped_value_projection_gradient(symbolic)
+            self.assertTrue(torch.equal(candidate_value, symbolic))
+            self.assertTrue(torch.isfinite(candidate_value).all())
+            candidate_value.float().sum().backward()
+            self.assertIsNotNone(model.value_proj.weight.grad)
+            assert model.value_proj.weight.grad is not None
+            self.assertEqual(
+                torch.count_nonzero(model.value_proj.weight.grad).item(), 0
+            )
+
+    def test_skipped_virtual_zero_is_numerically_dormant(self) -> None:
+        model = self.make_model(virtual_candidates=0).to(dtype=torch.bfloat16)
+        retrieved = torch.randn(2, 3, 8, dtype=torch.bfloat16)
+        updated = torch.randn(2, 3, 8, dtype=torch.bfloat16)
+
+        for corruption in ("maximum", "non_finite"):
+            with self.subTest(corruption=corruption), torch.no_grad():
+                for parameter in (
+                    model.virtual_query.weight,
+                    model.virtual_key.weight,
+                ):
+                    parameter.fill_(torch.finfo(torch.bfloat16).max)
+                    if corruption == "non_finite":
+                        flat_parameter = parameter.reshape(-1)
+                        flat_parameter[0] = torch.nan
+                        flat_parameter[1] = torch.inf
+                        flat_parameter[2] = -torch.inf
+            model.zero_grad(set_to_none=True)
+            actual_retrieved, actual_updated = model._attach_skipped_virtual_gradients(
+                retrieved, updated
+            )
+            self.assertTrue(torch.equal(actual_retrieved, retrieved))
+            self.assertTrue(torch.equal(actual_updated, updated))
+            self.assertTrue(torch.isfinite(actual_retrieved).all())
+            self.assertTrue(torch.isfinite(actual_updated).all())
+            (actual_retrieved.float().sum() + actual_updated.float().sum()).backward()
+            for parameter in (
+                model.virtual_query.weight,
+                model.virtual_key.weight,
+            ):
+                self.assertIsNotNone(parameter.grad)
+                assert parameter.grad is not None
+                self.assertEqual(torch.count_nonzero(parameter.grad).item(), 0)
+
+    def test_zero_neural_value_scale_matches_explicit_legacy_oracle(self) -> None:
+        torch.manual_seed(20260811)
+        base = self.make_model(
+            learned_residual_scale=1.0,
+            neural_value_scale=0.0,
+            value_gate_bias=0.0,
+        )
+        positions = torch.tensor([[1, 6], [2, 8]])
+
+        def legacy_oracle(
+            model: ROSA,
+            z: torch.Tensor,
+            query_positions: torch.Tensor | None,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, object]:
+            output = model(z, query_positions=query_positions)
+            non_null = output.candidate_mask & (output.candidate_kind != NULL_KIND)
+            next_position = torch.where(
+                non_null,
+                output.candidate_source_index + 1,
+                torch.zeros_like(output.candidate_source_index),
+            )
+            if query_positions is None:
+                symbol_sequence = (
+                    output.code_st[0] @ model.symbol_embedding_1.weight
+                    + output.code_st[1] @ model.symbol_embedding_2.weight
+                )
+                symbolic = _gather_sequence(symbol_sequence, next_position)
+                neural = model.value_proj(_gather_sequence(z, next_position))
+            else:
+                next_st1 = _gather_sequence(output.code_st[0], next_position)
+                next_st2 = _gather_sequence(output.code_st[1], next_position)
+                symbolic = (
+                    next_st1 @ model.symbol_embedding_1.weight
+                    + next_st2 @ model.symbol_embedding_2.weight
+                )
+                neural = _gather_sequence(model.value_proj(z), next_position)
+            symbolic = symbolic * non_null.unsqueeze(-1).to(z.dtype)
+            neural = neural * output.value_gate.unsqueeze(-1)
+            candidate = symbolic + model.neural_value_scale * neural
+            st_weights = output.hard_weights + (
+                output.soft_weights - output.soft_weights.detach()
+            )
+            retrieved = (st_weights.unsqueeze(-1) * candidate).sum(dim=-2)
+            updated = z + output.read_gate * model.out_proj(retrieved)
+            loss = (
+                updated.square().mean()
+                + retrieved.square().mean()
+                + output.value_gate.square().mean()
+            )
+            return updated, retrieved, loss, output
+
+        for query_positions in (None, positions):
+            with self.subTest(query_positions=query_positions):
+                optimized_model = copy.deepcopy(base)
+                oracle_model = copy.deepcopy(base)
+                z_optimized = torch.randn(2, 9, 8, requires_grad=True)
+                z_oracle = z_optimized.detach().clone().requires_grad_()
+
+                optimized = optimized_model(
+                    z_optimized, query_positions=query_positions
+                )
+                optimized_loss = (
+                    optimized.updated.square().mean()
+                    + optimized.retrieved.square().mean()
+                    + optimized.value_gate.square().mean()
+                )
+                oracle_updated, oracle_retrieved, oracle_loss, oracle = legacy_oracle(
+                    oracle_model, z_oracle, query_positions
+                )
+
+                self.assertTrue(torch.equal(optimized.updated, oracle_updated))
+                self.assertTrue(torch.equal(optimized.retrieved, oracle_retrieved))
+                self.assertTrue(torch.equal(optimized.value_gate, oracle.value_gate))
+                self.assertTrue(torch.equal(optimized_loss, oracle_loss))
+
+                optimized_loss.backward()
+                oracle_loss.backward()
+                torch.testing.assert_close(
+                    z_optimized.grad, z_oracle.grad, rtol=0, atol=0
+                )
+                for (optimized_name, optimized_parameter), (
+                    oracle_name,
+                    oracle_parameter,
+                ) in zip(
+                    optimized_model.named_parameters(),
+                    oracle_model.named_parameters(),
+                    strict=True,
+                ):
+                    self.assertEqual(optimized_name, oracle_name)
+                    self.assertIsNotNone(optimized_parameter.grad, optimized_name)
+                    self.assertIsNotNone(oracle_parameter.grad, oracle_name)
+                    torch.testing.assert_close(
+                        optimized_parameter.grad,
+                        oracle_parameter.grad,
+                        rtol=0,
+                        atol=0,
+                    )
+
     def test_prepared_candidates_are_bit_exact_and_shared_without_rebuild(self) -> None:
         torch.manual_seed(20260819)
         baseline_model = self.make_model(

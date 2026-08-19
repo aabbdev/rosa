@@ -1291,6 +1291,14 @@ class ROSA(nn.Module):
     def _candidate_neural_values(self, z_a: Tensor, next_position: Tensor) -> Tensor:
         return _gather_sequence(self.value_proj(z_a), next_position)
 
+    def _attach_skipped_value_projection_gradient(self, values: Tensor) -> Tensor:
+        if not torch.is_grad_enabled():
+            return values
+        value_zero = values.new_zeros(())
+        for parameter in self.value_proj.parameters():
+            value_zero = value_zero + parameter.reshape(-1)[:0].sum()
+        return values + value_zero
+
     def _hybrid_soft_candidates(
         self,
         st1: Tensor,
@@ -1406,7 +1414,7 @@ class ROSA(nn.Module):
         virtual_zero = retrieved.new_zeros(())
         for module in (self.virtual_query, self.virtual_key):
             for parameter in module.parameters():
-                virtual_zero = virtual_zero + parameter.sum() * 0
+                virtual_zero = virtual_zero + parameter.reshape(-1)[:0].sum()
         return retrieved + virtual_zero, updated + virtual_zero
 
     def _forward_query_only(
@@ -1702,9 +1710,14 @@ class ROSA(nn.Module):
             self.value_gate_head(torch.cat([query_expanded, cand_key], dim=-1))
         ).squeeze(-1)
         value_gate = value_gate * non_null_mask.to(z_a.dtype)
-        neural_value = self.value_proj(_gather_sequence(z_a, next_position))
-        neural_value = neural_value * value_gate.unsqueeze(-1)
-        candidate_value = symbolic_value + self.neural_value_scale * neural_value
+        if self.neural_value_scale.item() == 0.0:
+            candidate_value = self._attach_skipped_value_projection_gradient(
+                symbolic_value
+            )
+        else:
+            neural_value = self.value_proj(_gather_sequence(z_a, next_position))
+            neural_value = neural_value * value_gate.unsqueeze(-1)
+            candidate_value = symbolic_value + self.neural_value_scale * neural_value
         if (dense_count or sparse_count) and not self.soft_candidates_forward:
             historical_end = exact_slots + self.virtual_candidates
             historical_scores = torch.cat(
@@ -2043,9 +2056,14 @@ class ROSA(nn.Module):
             self.value_gate_head(torch.cat([query_expanded, cand_key], dim=-1))
         ).squeeze(-1)
         value_gate = value_gate * non_null_mask.to(z_a.dtype)
-        neural_value = self._candidate_neural_values(z_a, next_position)
-        neural_value = neural_value * value_gate.unsqueeze(-1)
-        candidate_value = symbolic_value + self.neural_value_scale * neural_value
+        if self.neural_value_scale.item() == 0.0:
+            candidate_value = self._attach_skipped_value_projection_gradient(
+                symbolic_value
+            )
+        else:
+            neural_value = self._candidate_neural_values(z_a, next_position)
+            neural_value = neural_value * value_gate.unsqueeze(-1)
+            candidate_value = symbolic_value + self.neural_value_scale * neural_value
         hybrid_enabled = bool(
             self.dense_recent_candidates or self.sparse_old_candidates
         )
