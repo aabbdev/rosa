@@ -434,7 +434,7 @@ def _build_stateful_hard_candidates(
             *(getattr(result, name)[0] for name in result.__dataclass_fields__)
         )
     finally:
-        state.native_state = None
+        state.close()
 
 
 def _build_forward_hard_candidates(
@@ -1432,26 +1432,34 @@ class ROSAInferenceState:
     ragged: bool
     suffix_k: int
     occurrences_r: int
-    _impl: object = field(repr=False)
+    _impl: object | None = field(repr=False)
+
+    def _require_impl(self) -> object:
+        impl = self._impl
+        if impl is None:
+            raise RuntimeError("state is closed")
+        return impl
 
     @property
     def position(self) -> int:
         """Number of tokens consumed by every batch row."""
 
+        impl = self._require_impl()
         if self.ragged:
             raise AttributeError(
                 "position is undefined for ragged states; use positions"
             )
-        return int(cast(Any, self._impl).position)
+        return int(cast(Any, impl).position)
 
     @property
     def positions(self) -> Tensor:
         """Consumed-token counts for every row, always returned as a copy."""
 
+        impl = self._require_impl()
         if self.ragged:
             if self.mode == "top1":
-                return cast(Any, self._impl).positions.clone()
-            return torch.from_numpy(cast(Any, self._impl).positions.copy())
+                return cast(Any, impl).positions.clone()
+            return torch.from_numpy(cast(Any, impl).positions.copy())
         return torch.full((self.batch_size,), self.position, dtype=torch.long)
 
     def step(
@@ -1462,6 +1470,7 @@ class ROSAInferenceState:
     ) -> InferenceOutput:
         """Consume one token per selected row using the configured mode."""
 
+        self._require_impl()
         return _inference_step(self, tokens, active=active, reset=reset)
 
     def step_into(self, tokens: Tensor, buffers: object) -> InferenceOutput:
@@ -1470,16 +1479,37 @@ class ROSAInferenceState:
         Candidate tensors in the result alias ``buffers`` until its next use.
         """
 
+        self._require_impl()
         return _inference_step_into(self, tokens, buffers)
 
     def prefill(self, tokens: Tensor) -> InferenceOutput:
         """Consume an initial dense context and return every step result."""
 
+        self._require_impl()
         return _inference_prefill(self, tokens)
 
-    def reset(self) -> None:
-        """Reset all batch rows while retaining the configured capacity."""
+    def close(self) -> None:
+        """Release persistent backend storage; repeated calls are safe."""
 
+        impl = self._impl
+        if impl is None:
+            return
+        self._impl = None
+        close = getattr(impl, "close", None)
+        if close is not None:
+            close()
+
+    def __enter__(self) -> ROSAInferenceState:
+        self._require_impl()
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+    def reset(self) -> None:
+        """Replace storage with a fresh open state, reopening a closed state."""
+
+        self.close()
         self._impl = _make_inference_impl(
             self.batch_size,
             self.max_length,

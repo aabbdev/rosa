@@ -11,6 +11,15 @@ from rosa.ragged import RaggedInferenceState, init_ragged_state
 
 
 class TestRaggedInference(unittest.TestCase):
+    def test_close_is_idempotent_and_rejects_use(self) -> None:
+        state = init_ragged_state(1, 2, use_native=False)
+        state.close()
+        state.close()
+        with self.assertRaisesRegex(RuntimeError, "^state is closed$"):
+            _ = state.positions
+        with self.assertRaisesRegex(RuntimeError, "^state is closed$"):
+            state.step(torch.tensor([0]))
+
     def test_mask_reset_and_recycling_match_single_row_oracles(self) -> None:
         from rosa._stateful_numba import _forward_step, _init_inference_state
 

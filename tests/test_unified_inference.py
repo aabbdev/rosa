@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import gc
 import unittest
+import weakref
 from typing import Any, cast
 
 import torch
@@ -21,6 +23,57 @@ from rosa import (
 
 
 class TestUnifiedInferenceState(unittest.TestCase):
+    def test_close_context_manager_and_reset_lifetime(self) -> None:
+        tokens = torch.tensor([[0, 1, 0]], dtype=torch.long)
+        expected = reference_rosa(tokens)[0]
+
+        with init_inference_state(1, 3, mode="rich", suffix_k=2) as managed:
+            buffers = init_candidate_buffers(managed)
+            self.assertTrue(
+                torch.equal(managed.prefill(tokens).predicted_tokens, expected)
+            )
+        for access in (
+            lambda: managed.position,
+            lambda: managed.positions,
+            lambda: managed.step(torch.tensor([0])),
+            lambda: managed.step_into(torch.tensor([0]), buffers),
+            lambda: managed.prefill(tokens),
+        ):
+            with self.subTest(access=access), self.assertRaisesRegex(
+                RuntimeError, "^state is closed$"
+            ):
+                access()
+        managed.close()
+
+        for mode in ("top1", "rich"):
+            with self.subTest(mode=mode):
+                state = init_inference_state(1, 3, mode=mode)  # type: ignore[arg-type]
+                old_impl = state._impl
+                assert old_impl is not None
+
+                class NativeOwner:
+                    def __init__(self, impl: object) -> None:
+                        self.impl = impl
+
+                old_impl.native_state = NativeOwner(old_impl)  # type: ignore[attr-defined]
+                impl_ref = weakref.ref(old_impl)
+                array_ref = weakref.ref(old_impl.history)  # type: ignore[attr-defined]
+                del old_impl
+                state.reset()
+                gc.collect()
+                self.assertIsNone(impl_ref())
+                self.assertIsNone(array_ref())
+                self.assertEqual(state.positions.tolist(), [0])
+                self.assertTrue(
+                    torch.equal(state.prefill(tokens).predicted_tokens, expected)
+                )
+                state.close()
+                state.reset()
+                self.assertEqual(state.position, 0)
+                self.assertTrue(
+                    torch.equal(state.prefill(tokens).predicted_tokens, expected)
+                )
+
     def test_uniform_mode_matrix_prefill_continuation_and_reset(self) -> None:
         tokens = torch.tensor(
             [[0, 1, 0, 2, 0, 3], [4, 4, 5, 4, 4, 6]], dtype=torch.long

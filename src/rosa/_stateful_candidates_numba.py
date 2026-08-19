@@ -989,6 +989,28 @@ class CandidateState:
     size: np.ndarray
     edge_count: np.ndarray
     native_state: Any
+    _closed: bool = field(default=False, init=False, repr=False)
+
+    def __getattribute__(self, name: str) -> Any:
+        if name in {"position", "positions"} and object.__getattribute__(
+            self, "_closed"
+        ):
+            raise RuntimeError("state is closed")
+        return object.__getattribute__(self, name)
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("state is closed")
+
+    def close(self) -> None:
+        """Release native ownership deterministically; repeated calls are safe."""
+
+        if self._closed:
+            return
+        self._closed = True
+        # NativeCandidateState retains this Python state. Detaching this end of
+        # the relationship breaks the cycle without requiring a native API.
+        self.native_state = None
 
 
 @dataclass(frozen=True)
@@ -1048,6 +1070,7 @@ def init_candidate_buffers(
 
     if not isinstance(state, CandidateState):
         raise TypeError("state must be a CandidateState")
+    state._ensure_open()
     if sequence_length is not None and sequence_length < 0:
         raise ValueError("sequence_length must be >= 0")
     slots = state.suffix_k * state.occurrences_r
@@ -1188,6 +1211,7 @@ def _validate_candidate_tokens(
 ) -> tuple[Tensor, bool]:
     if not isinstance(state, CandidateState):
         raise TypeError("state must be a CandidateState")
+    state._ensure_open()
     if not isinstance(tokens, Tensor):
         raise TypeError("tokens must be a Tensor")
     scalar = tokens.ndim == 0 and state.batch_size == 1 and not sequence
@@ -1624,6 +1648,7 @@ def reset_candidates_masked(state: CandidateState, reset: Tensor) -> None:
 
     if not isinstance(state, CandidateState):
         raise TypeError("state must be a CandidateState")
+    state._ensure_open()
     if not state.ragged_mode:
         raise RuntimeError("reset_masked requires a ragged candidate state")
     if not isinstance(reset, Tensor):

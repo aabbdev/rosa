@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import gc
 import sys
 import unittest
+import weakref
 from itertools import product
 from unittest.mock import patch
 
@@ -41,6 +43,35 @@ _FIELDS = (
 
 
 class TestStatefulCandidates(unittest.TestCase):
+    def test_close_is_idempotent_breaks_cycles_and_rejects_use(self) -> None:
+        state = init_candidate_state_internal(1, 2, suffix_k=2, occurrences_r=2)
+        buffers = init_candidate_buffers(state)
+
+        class NativeOwner:
+            def __init__(self, candidate_state: CandidateState) -> None:
+                self.candidate_state = candidate_state
+
+        state.native_state = NativeOwner(state)
+        native_ref = weakref.ref(state.native_state)
+        state.close()
+        state.close()
+        self.assertIsNone(native_ref())
+        with self.assertRaisesRegex(RuntimeError, "^state is closed$"):
+            _ = state.position
+        with self.assertRaisesRegex(RuntimeError, "^state is closed$"):
+            _ = state.positions
+        with self.assertRaisesRegex(RuntimeError, "^state is closed$"):
+            forward_candidates_step(state, torch.tensor([0]))
+        with self.assertRaisesRegex(RuntimeError, "^state is closed$"):
+            forward_candidates_step_into(state, torch.tensor([0]), buffers)
+        with self.assertRaisesRegex(RuntimeError, "^state is closed$"):
+            prefill_candidates(state, torch.tensor([[0]]))
+
+        state_ref = weakref.ref(state)
+        del state
+        gc.collect()
+        self.assertIsNone(state_ref())
+
     def assert_matches_oracle(
         self,
         tokens: torch.Tensor,
