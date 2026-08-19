@@ -420,15 +420,21 @@ def _build_stateful_hard_candidates(
         suffix_k=suffix_k,
         occurrences_r=occurrences_r,
     )
-    candidates = prefill_candidates(state, tokens)
-    result = HardCandidates(
-        *(getattr(candidates, name) for name in HardCandidates.__dataclass_fields__)
-    )
-    if not squeeze:
-        return result
-    return HardCandidates(
-        *(getattr(result, name)[0] for name in result.__dataclass_fields__)
-    )
+    try:
+        candidates = prefill_candidates(state, tokens)
+        result = HardCandidates(
+            *(
+                getattr(candidates, name)
+                for name in HardCandidates.__dataclass_fields__
+            )
+        )
+        if not squeeze:
+            return result
+        return HardCandidates(
+            *(getattr(result, name)[0] for name in result.__dataclass_fields__)
+        )
+    finally:
+        state.native_state = None
 
 
 def _build_forward_hard_candidates(

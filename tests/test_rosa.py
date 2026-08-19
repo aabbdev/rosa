@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import copy
+import gc
 import random
 import threading
 import unittest
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -941,6 +944,90 @@ class TestROSASemantics(unittest.TestCase):
         assert captured is not None
         for name in hard.__dataclass_fields__:
             self.assertIs(getattr(hard, name), getattr(captured, name), name)
+
+    def test_stateful_one_shot_releases_native_state_and_storage(self) -> None:
+        try:
+            import rosa_native_step
+        except ModuleNotFoundError:
+            self.skipTest("native companion is unavailable")
+        if getattr(rosa_native_step, "NativeCandidateState", None) is None:
+            self.skipTest("native candidate backend is unavailable")
+
+        from rosa._stateful_candidates_numba import (
+            init_candidate_state,
+            prefill_candidates,
+        )
+
+        tokens = torch.tensor([[0, 1, 0, 2, 0, 1]], dtype=torch.long)
+        expected = build_hard_candidates(tokens, suffix_k=3, occurrences_r=2)
+        state_ref = None
+        array_refs = []
+        native_used = False
+
+        def tracked_initialize(*args, **kwargs):
+            nonlocal state_ref, array_refs
+            state = init_candidate_state(*args, **kwargs)
+            state_ref = weakref.ref(state)
+            array_refs = [
+                weakref.ref(value)
+                for value in vars(state).values()
+                if isinstance(value, np.ndarray)
+            ]
+            return state
+
+        def tracked_prefill(state, full_tokens):
+            nonlocal native_used
+            candidates = prefill_candidates(state, full_tokens)
+            native_used = state.native_state not in (None, False)
+            return candidates
+
+        with (
+            patch(
+                "rosa._stateful_candidates_numba.init_candidate_state",
+                side_effect=tracked_initialize,
+            ),
+            patch(
+                "rosa._stateful_candidates_numba.prefill_candidates",
+                side_effect=tracked_prefill,
+            ),
+        ):
+            actual = rosa._build_stateful_hard_candidates(tokens, 3, 2)
+
+        self.assertTrue(native_used)
+        for name in expected.__dataclass_fields__:
+            self.assertTrue(
+                torch.equal(getattr(actual, name), getattr(expected, name)), name
+            )
+        gc.collect()
+        assert state_ref is not None
+        self.assertIsNone(state_ref())
+        self.assertTrue(array_refs)
+        self.assertTrue(all(array_ref() is None for array_ref in array_refs))
+
+    def test_stateful_one_shot_detaches_native_state_on_exception(self) -> None:
+        from rosa._stateful_candidates_numba import init_candidate_state
+
+        state = init_candidate_state(1, 3, suffix_k=2, occurrences_r=2)
+
+        class NativeOwner:
+            def __init__(self, candidate_state):
+                self.candidate_state = candidate_state
+
+        native = NativeOwner(state)
+        state.native_state = native
+        with (
+            patch(
+                "rosa._stateful_candidates_numba.init_candidate_state",
+                return_value=state,
+            ),
+            patch(
+                "rosa._stateful_candidates_numba.prefill_candidates",
+                side_effect=RuntimeError("prefill failed"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "prefill failed"),
+        ):
+            rosa._build_stateful_hard_candidates(torch.tensor([[0, 1, 0]]), 2, 2)
+        self.assertIsNone(state.native_state)
 
     def test_stateful_full_sequence_preserves_scalar_batch_squeeze(self) -> None:
         tokens = torch.tensor([0, 1, 0, 2, 0, 1], dtype=torch.long)
