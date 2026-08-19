@@ -661,6 +661,168 @@ class TestROSASemantics(unittest.TestCase):
         else:
             self.assertEqual(actual, expected, name)
 
+    def test_query_positions_validation_and_keyword_only_signature(self) -> None:
+        model = self.make_model(candidate_backend="python")
+        z = torch.randn(2, 7, 8)
+        with self.assertRaisesRegex(TypeError, "must be a Tensor"):
+            model(z, query_positions=[[1], [2]])  # type: ignore[arg-type]
+        with self.assertRaisesRegex(TypeError, "dtype torch.long"):
+            model(z, query_positions=torch.zeros(2, 1))
+        for positions, message in (
+            (torch.zeros(2, dtype=torch.long), r"\[B, Q\]"),
+            (torch.zeros(1, 1, dtype=torch.long), r"\[B, Q\]"),
+            (torch.empty(2, 0, dtype=torch.long), "at least one"),
+            (torch.tensor([[0, 7], [1, 2]]), r"\[0, N\)"),
+            (torch.tensor([[1, 1], [2, 3]]), "unique"),
+        ):
+            with (
+                self.subTest(message=message),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                model(z, query_positions=positions)
+        with self.assertRaises(TypeError):
+            model(z, None, None, torch.tensor([[1], [2]]))
+
+    def test_query_positions_matches_full_gradients_and_sentinels(self) -> None:
+        devices = [torch.device("cpu")]
+        if torch.cuda.is_available():
+            devices.append(torch.device("cuda"))
+        discrete_fields = (
+            "hard_tokens",
+            "candidate_source_index",
+            "candidate_kind",
+            "candidate_mask",
+            "chosen_candidate",
+            "chosen_source_index",
+            "chosen_token",
+            "chosen_match_length",
+            "chosen_is_virtual",
+            "hard_rosa_source_index",
+            "hard_rosa_predicted_tokens",
+            "hard_rosa_match_length",
+        )
+        float_fields = (
+            "updated",
+            "retrieved",
+            "candidate_scores",
+            "soft_weights",
+            "hard_weights",
+            "soft_match_score",
+            "read_gate",
+            "value_gate",
+        )
+        for device in devices:
+            for backend in ("python", "stateful"):
+                with self.subTest(device=device, backend=backend):
+                    torch.manual_seed(20260819)
+                    full_model = self.make_model(
+                        candidate_backend=backend,
+                        learned_residual_scale=1.0,
+                        neural_value_scale=1.0,
+                        dense_recent_candidates=2,
+                        sparse_old_candidates=1,
+                        sparse_old_pool_size=4,
+                    ).to(device)
+                    query_model = copy.deepcopy(full_model)
+                    z_full = torch.randn(2, 17, 8, device=device, requires_grad=True)
+                    z_query = z_full.detach().clone().requires_grad_()
+                    positions = torch.tensor([[1, 6, 15], [2, 9, 16]], device=device)
+                    full = full_model(z_full)
+                    query = query_model(z_query, query_positions=positions)
+                    batch = torch.arange(2, device=device).unsqueeze(1)
+                    for name in discrete_fields:
+                        expected = getattr(full, name)
+                        actual = getattr(query, name)
+                        if name != "hard_tokens":
+                            expected = expected[batch, positions]
+                            actual = actual[batch, positions]
+                        self.assertTrue(torch.equal(actual, expected), name)
+                    for name in float_fields:
+                        expected = getattr(full, name)[batch, positions]
+                        actual = getattr(query, name)[batch, positions]
+                        torch.testing.assert_close(
+                            actual, expected, rtol=2e-6, atol=2e-7
+                        )
+
+                    query_mask = torch.zeros((2, 17), dtype=torch.bool, device=device)
+                    query_mask.scatter_(1, positions, True)
+                    non_query = ~query_mask
+                    self.assertTrue(
+                        torch.equal(query.updated[non_query], z_query[non_query])
+                    )
+                    for name in ("retrieved", "soft_weights", "hard_weights"):
+                        self.assertTrue(
+                            torch.count_nonzero(getattr(query, name)[non_query]) == 0
+                        )
+                    self.assertTrue(
+                        torch.isneginf(query.candidate_scores[non_query]).all()
+                    )
+                    self.assertTrue(
+                        (query.candidate_source_index[non_query] == -1).all()
+                    )
+                    self.assertTrue((query.candidate_kind[non_query] == -1).all())
+                    self.assertFalse(query.candidate_mask[non_query].any())
+                    for name in (
+                        "chosen_candidate",
+                        "chosen_source_index",
+                        "chosen_token",
+                        "hard_rosa_source_index",
+                        "hard_rosa_predicted_tokens",
+                    ):
+                        self.assertTrue(
+                            (getattr(query, name)[non_query] == -1).all(), name
+                        )
+                    for name in (
+                        "chosen_match_length",
+                        "hard_rosa_match_length",
+                        "soft_match_score",
+                        "read_gate",
+                        "value_gate",
+                    ):
+                        self.assertTrue(
+                            torch.count_nonzero(getattr(query, name)[non_query]) == 0,
+                            name,
+                        )
+
+                    def selected_loss(output):
+                        return (
+                            output.updated[batch, positions].square().mean()
+                            + output.retrieved[batch, positions].square().mean()
+                            + output.soft_weights[batch, positions].square().mean()
+                            + sum(item.square().mean() for item in output.code_soft)
+                        )
+
+                    selected_loss(full).backward()
+                    selected_loss(query).backward()
+                    torch.testing.assert_close(
+                        z_query.grad, z_full.grad, rtol=2e-6, atol=2e-7
+                    )
+                    for (_, full_parameter), (_, query_parameter) in zip(
+                        full_model.named_parameters(),
+                        query_model.named_parameters(),
+                        strict=True,
+                    ):
+                        self.assertEqual(
+                            full_parameter.grad is None, query_parameter.grad is None
+                        )
+                        if full_parameter.grad is not None:
+                            torch.testing.assert_close(
+                                query_parameter.grad,
+                                full_parameter.grad,
+                                rtol=2e-6,
+                                atol=2e-7,
+                            )
+
+    def test_query_positions_full_arange_is_bit_exact_legacy_route(self) -> None:
+        model = self.make_model(candidate_backend="python")
+        z_a = torch.randn(2, 9, 8)
+        z_b = torch.randn_like(z_a)
+        legacy = model(z_a, z_b, None)
+        positions = torch.arange(9).expand(2, -1)
+        query = model(z_a, z_b, None, query_positions=positions)
+        for name in legacy.__dataclass_fields__:
+            self.assert_nested_equal(getattr(query, name), getattr(legacy, name), name)
+
     def test_python_and_stateful_backends_match_all_fields_outputs_and_gradients(
         self,
     ) -> None:
