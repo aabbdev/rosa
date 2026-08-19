@@ -1,11 +1,24 @@
 from __future__ import annotations
 
+import gc
+import weakref
+
 import numpy as np
 import rosa_native_step
 import torch
 
 from rosa._stateful_numba import _forward_step, _init_inference_state, _prefill
 from rosa.ragged import RaggedInferenceState
+
+
+def nonweak_owner(source: object) -> object:
+    class NonWeakOwner:
+        __slots__ = tuple(vars(source))
+
+    owner = NonWeakOwner()
+    for name, value in vars(source).items():
+        setattr(owner, name, value)
+    return owner
 
 
 def assert_same_initialized_state(oracle: object, candidate: object) -> None:
@@ -76,6 +89,45 @@ def main() -> None:
     assert isinstance(candidate.native_state, rosa_native_step.NativeState)
     assert candidate.native_state.position == tokens.shape[1]
     assert candidate.position == tokens.shape[1]
+
+    # The wrapper owns the NumPy buffers, but only weakly observes the Python
+    # state for position publication.  It therefore survives its owner, and a
+    # normal owner -> wrapper link does not form an uncollectable cycle.
+    detached_owner = _init_inference_state(2, 4)
+    detached_owner_ref = weakref.ref(detached_owner)
+    detached_history_ref = weakref.ref(detached_owner.history)
+    detached = rosa_native_step.NativeState(detached_owner)
+    detached_owner.position = 3
+    detached.step(np.array([3, 5], dtype=np.int64))
+    assert detached_owner.position == detached.position == 1
+    del detached_owner
+    gc.collect()
+    assert detached_owner_ref() is None
+    assert detached_history_ref() is not None
+    detached.step(np.array([7, 9], dtype=np.int64))
+    assert detached.position == 2
+    assert detached_history_ref()[:, :2].tolist() == [[3, 7], [5, 9]]
+
+    cyclic_owner = _init_inference_state(1, 2)
+    cyclic_wrapper = rosa_native_step.NativeState(cyclic_owner)
+    cyclic_owner.native_state = cyclic_wrapper
+    cyclic_owner_ref = weakref.ref(cyclic_owner)
+    cyclic_wrapper_ref = weakref.ref(cyclic_wrapper)
+    del cyclic_owner, cyclic_wrapper
+    gc.collect()
+    assert cyclic_owner_ref() is None
+    assert cyclic_wrapper_ref() is None
+
+    nonweak_state = nonweak_owner(_init_inference_state(1, 2))
+    try:
+        weakref.ref(nonweak_state)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("slotted owner unexpectedly supports weak references")
+    nonweak = rosa_native_step.NativeState(nonweak_state)
+    nonweak.step(np.array([11], dtype=np.int64))
+    assert nonweak.position == 1
 
     generator = torch.Generator().manual_seed(20260811)
     cases = [

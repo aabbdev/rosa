@@ -21,6 +21,16 @@ from rosa._stateful_candidates_numba import (
 )
 
 
+def nonweak_owner(source: object) -> object:
+    class NonWeakOwner:
+        __slots__ = tuple(vars(source))
+
+    owner = NonWeakOwner()
+    for name, value in vars(source).items():
+        setattr(owner, name, value)
+    return owner
+
+
 def assert_step_equal(actual: tuple[np.ndarray, ...], expected: CandidateStep) -> None:
     expected_arrays = (
         expected.source_index.numpy(),
@@ -123,6 +133,28 @@ def main() -> None:
     assert all(
         np.array_equal(actual, expected)
         for actual, expected in zip(prefill_arrays, prefill_allocating, strict=True)
+    )
+
+    selected_queries = np.array([[2, 0], [1, 2]], dtype=np.int64)
+    selected_state = rosa_native_step.NativeCandidateState(
+        init_candidate_state(2, 4, suffix_k=2, occurrences_r=2)
+    )
+    selected = selected_state.prefill_selected(prefix, selected_queries)
+    batch = np.arange(2)[:, None]
+    assert all(
+        np.array_equal(actual, expected[batch, selected_queries])
+        for actual, expected in zip(selected, prefill_allocating, strict=True)
+    )
+    continuation_tokens = np.array([2, 5], dtype=np.int64)
+    selected_tail = selected_state.step(continuation_tokens)
+    full_state = rosa_native_step.NativeCandidateState(
+        init_candidate_state(2, 4, suffix_k=2, occurrences_r=2)
+    )
+    full_state.prefill(prefix)
+    full_tail = full_state.step(continuation_tokens)
+    assert all(
+        np.array_equal(actual, expected)
+        for actual, expected in zip(selected_tail, full_tail, strict=True)
     )
 
     # Pools are lazy, never useful below the prefill threshold, and invalid
@@ -290,11 +322,39 @@ def main() -> None:
 
     state = init_candidate_state(2, 4, suffix_k=3, occurrences_r=2)
     state_ref = weakref.ref(state)
+    history_ref = weakref.ref(state.history)
     native = rosa_native_step.NativeCandidateState(state)
+    state.position = 3
+    native.step(np.array([1, 2], dtype=np.int64))
+    assert state.position == native.position == 1
     del state
     gc.collect()
-    assert state_ref() is not None
-    native.step(np.array([1, 2], dtype=np.int64))
+    assert state_ref() is None
+    assert history_ref() is not None
+    native.step(np.array([3, 4], dtype=np.int64))
+    assert native.position == 2
+    assert history_ref()[:, :2].tolist() == [[1, 3], [2, 4]]
+
+    cyclic_owner = init_candidate_state(1, 2)
+    cyclic_wrapper = rosa_native_step.NativeCandidateState(cyclic_owner)
+    cyclic_owner.native_state = cyclic_wrapper
+    cyclic_owner_ref = weakref.ref(cyclic_owner)
+    cyclic_wrapper_ref = weakref.ref(cyclic_wrapper)
+    del cyclic_owner, cyclic_wrapper
+    gc.collect()
+    assert cyclic_owner_ref() is None
+    assert cyclic_wrapper_ref() is None
+
+    nonweak_state = nonweak_owner(init_candidate_state(1, 2))
+    try:
+        weakref.ref(nonweak_state)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("slotted owner unexpectedly supports weak references")
+    nonweak = rosa_native_step.NativeCandidateState(nonweak_state)
+    nonweak.step(np.array([11], dtype=np.int64))
+    assert nonweak.position == 1
 
     # ABI 1 compatibility: pre-positions uniform states remain accepted.
     legacy = init_candidate_state(1, 2)

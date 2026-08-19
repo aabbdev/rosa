@@ -612,19 +612,29 @@ wheels = [
 
 [[package]]
 name = "rosa-torch"
-version = "0.3.0"
-source = { registry = "https://pypi.org/simple" }
+version = "0.4.0"
+source = { directory = "../" }
 dependencies = [
     { name = "torch" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/46/20/88b88b9b6307f72a2c3892405897efd370c7614abf49489569069ba7340d/rosa_torch-0.3.0.tar.gz", hash = "sha256:19009a36049c994bbc2950d1c9c9f113819f047dccc235a88ccd5d70eb35a677", size = 46505, upload-time = "2026-08-18T13:15:59.421Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/53/bc/5477145f95f309938cd271e48892ca3721a1f425551ed0600f9c005aef3d/rosa_torch-0.3.0-py3-none-any.whl", hash = "sha256:8c143a8cd681ec30ca7783b80254057f750cc371542d35f2504ecf123a3b14a5", size = 48752, upload-time = "2026-08-18T13:15:58.144Z" },
+
+[package.metadata]
+requires-dist = [
+    { name = "numba", marker = "extra == 'numba'", specifier = ">=0.66" },
+    { name = "torch" },
+]
+provides-extras = ["numba"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "coverage", specifier = ">=7.10" },
+    { name = "pyright", extras = ["nodejs"], specifier = ">=1.1.400" },
+    { name = "ruff", specifier = ">=0.11" },
 ]
 
 [[package]]
 name = "rosa-torch-native"
-version = "0.3.0"
+version = "0.4.0"
 source = { editable = "." }
 dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -636,7 +646,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "numpy", specifier = ">=1.24" },
-    { name = "rosa-torch", specifier = ">=0.3,<0.4" },
+    { name = "rosa-torch", directory = "../" },
 ]
 
 [[package]]

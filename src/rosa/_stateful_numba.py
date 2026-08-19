@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -1121,6 +1121,19 @@ class _StatefulInferenceState:
     size: np.ndarray
     edge_count: np.ndarray
     native_state: Any
+    _closed: bool = field(default=False, init=False, repr=False)
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("state is closed")
+
+    def close(self) -> None:
+        """Break the optional native ownership cycle idempotently."""
+
+        if self._closed:
+            return
+        self._closed = True
+        self.native_state = None
 
 
 def _init_inference_state(
@@ -1214,6 +1227,7 @@ def _native_prefill(  # pragma: no cover - optional native companion
 def _forward_step(state: _StatefulInferenceState, tokens: Tensor) -> Tensor:
     """Consume one token per batch row and return exact top-1 predictions."""
 
+    state._ensure_open()
     if tokens.ndim == 0 and state.batch_size == 1:
         tokens = tokens.unsqueeze(0)
     if tokens.ndim != 1 or tokens.shape[0] != state.batch_size:
@@ -1256,6 +1270,7 @@ def _forward_step(state: _StatefulInferenceState, tokens: Tensor) -> Tensor:
 def _prefill(state: _StatefulInferenceState, tokens: Tensor) -> Tensor:
     """Consume a full initial context through one fused compiled replay."""
 
+    state._ensure_open()
     if state.position != 0:
         raise RuntimeError("prefill requires an empty inference state")
     if tokens.ndim != 2 or tokens.shape[0] != state.batch_size:

@@ -44,6 +44,21 @@ class RaggedInferenceState:
         setattr(self._state, "positions", self._positions)
         self._use_native = use_native
         self._native: Any = None
+        self._closed = False
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("state is closed")
+
+    def close(self) -> None:
+        """Release optional native ownership cycles idempotently."""
+
+        if self._closed:
+            return
+        self._closed = True
+        self._native = None
+        self._state.native_state = None
+        self._state.close()
 
     @property
     def batch_size(self) -> int:
@@ -61,6 +76,7 @@ class RaggedInferenceState:
     def positions(self) -> Tensor:
         """Current consumed-token count for each row, returned as a copy."""
 
+        self._ensure_open()
         return torch.from_numpy(self._positions.copy())
 
     @property
@@ -70,6 +86,7 @@ class RaggedInferenceState:
         return self._native not in (None, False)
 
     def _native_state(self) -> Any:
+        self._ensure_open()
         if not self._use_native or self._native is False:
             return None
         if self._native is None:
@@ -97,6 +114,7 @@ class RaggedInferenceState:
     ) -> Tensor:
         """Consume tokens for active rows, optionally recycling selected slots."""
 
+        self._ensure_open()
         if not isinstance(tokens, Tensor):
             raise TypeError("tokens must be a Tensor")
         if tokens.ndim == 0 and self.batch_size == 1:

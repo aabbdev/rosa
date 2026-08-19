@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import copy
+import gc
 import random
 import threading
 import unittest
+import weakref
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import FrozenInstanceError, replace
 from unittest.mock import patch
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -15,8 +19,10 @@ from rosa import (
     NULL_KIND,
     ROSA,
     VIRTUAL_KIND,
+    PreparedHardCandidates,
     _balance_kl,
     _build_forward_hard_candidates,
+    _build_forward_hard_candidates_selected,
     _clear_soft_match_compile_cache,
     _gather_sequence,
     _soft_match,
@@ -526,7 +532,7 @@ class TestROSAConfiguration(unittest.TestCase):
             (dict(d_model=4, suffix_k=0), "suffix_k"),
             (dict(d_model=4, occurrences_r=0), "suffix_k"),
             (dict(d_model=4, soft_verify_window=0), "suffix_k"),
-            (dict(d_model=4, virtual_candidates=0), "virtual_pool_size"),
+            (dict(d_model=4, virtual_candidates=-1), "virtual_pool_size"),
             (
                 dict(d_model=4, virtual_candidates=4, virtual_pool_size=3),
                 "virtual_pool_size",
@@ -657,6 +663,935 @@ class TestROSASemantics(unittest.TestCase):
                 self.assert_nested_equal(actual[key], expected[key], f"{name}.{key}")
         else:
             self.assertEqual(actual, expected, name)
+
+    def test_zero_virtual_candidates_skip_virtual_work_and_have_exact_width(
+        self,
+    ) -> None:
+        model = self.make_model(
+            suffix_k=2,
+            occurrences_r=3,
+            virtual_candidates=0,
+            dense_recent_candidates=2,
+            sparse_old_candidates=1,
+            sparse_old_pool_size=3,
+        )
+        z = torch.randn(2, 9, 8)
+        positions = torch.tensor([[1, 5], [2, 8]])
+        virtual_calls = 0
+
+        def virtual_hook(_module, _args, _output) -> None:
+            nonlocal virtual_calls
+            virtual_calls += 1
+
+        hooks = [
+            model.virtual_query.register_forward_hook(virtual_hook),
+            model.virtual_key.register_forward_hook(virtual_hook),
+        ]
+        try:
+            with (
+                patch.object(
+                    model,
+                    "_virtual_candidates",
+                    side_effect=AssertionError("unexpected virtual candidates"),
+                ),
+                patch(
+                    "rosa.build_virtual_pool_indices",
+                    side_effect=AssertionError("unexpected virtual pool"),
+                ),
+                patch(
+                    "rosa.torch.topk",
+                    side_effect=AssertionError("unexpected virtual topk"),
+                ),
+            ):
+                full = model(z)
+                query_only = model(z, query_positions=positions)
+
+                for output_name, query in (
+                    ("retrieved", None),
+                    ("updated", None),
+                    ("retrieved", positions),
+                    ("updated", positions),
+                ):
+                    model.zero_grad(set_to_none=True)
+                    output = model(z, query_positions=query)
+                    getattr(output, output_name).sum().backward()
+                    for parameter in (
+                        model.virtual_query.weight,
+                        model.virtual_key.weight,
+                    ):
+                        self.assertIsNotNone(parameter.grad)
+                        assert parameter.grad is not None
+                        self.assertEqual(torch.count_nonzero(parameter.grad).item(), 0)
+
+                with torch.no_grad():
+                    no_grad_full = model(z)
+                    no_grad_query = model(z, query_positions=positions)
+                with torch.inference_mode():
+                    inference_full = model(z)
+                    inference_query = model(z, query_positions=positions)
+        finally:
+            for hook in hooks:
+                hook.remove()
+
+        expected_width = 2 * 3 + 2 + 1 + 1
+        self.assertEqual(full.candidate_source_index.shape[-1], expected_width)
+        self.assertEqual(query_only.candidate_source_index.shape[-1], expected_width)
+        self.assertEqual(full.value_gate.shape[-1], expected_width)
+        self.assertEqual(query_only.value_gate.shape[-1], expected_width)
+        self.assertEqual(virtual_calls, 0)
+        for reference, no_grad, inference in (
+            (full, no_grad_full, inference_full),
+            (query_only, no_grad_query, inference_query),
+        ):
+            for name in ("retrieved", "updated"):
+                self.assertTrue(
+                    torch.equal(getattr(reference, name), getattr(no_grad, name))
+                )
+                self.assertTrue(
+                    torch.equal(getattr(reference, name), getattr(inference, name))
+                )
+
+    def test_zero_virtual_checkpoint_compatibility_and_runtime_reactivation(
+        self,
+    ) -> None:
+        source = self.make_model(
+            suffix_k=4,
+            occurrences_r=4,
+            virtual_candidates=1,
+        )
+        target = self.make_model(
+            suffix_k=1,
+            occurrences_r=1,
+            virtual_candidates=0,
+        )
+        incompatible = target.load_state_dict(source.state_dict(), strict=True)
+        self.assertEqual(incompatible.missing_keys, [])
+        self.assertEqual(incompatible.unexpected_keys, [])
+        self.assertIn("virtual_query.weight", target.state_dict())
+        self.assertIn("virtual_key.weight", target.state_dict())
+
+        z = torch.randn(1, 8, 8)
+        hard_tokens = target.encode(z)[2]
+        prepared_k1r1 = target.prepare_hard_candidates(hard_tokens)
+        prepared_k4r4 = source.prepare_hard_candidates(hard_tokens)
+        with self.assertRaisesRegex(ValueError, "suffix_k"):
+            target(z, hard_candidates=prepared_k4r4)
+
+        target.suffix_k = 2
+        with self.assertRaisesRegex(ValueError, "suffix_k"):
+            target(z, hard_candidates=prepared_k1r1)
+        target.suffix_k = 1
+        target.occurrences_r = 2
+        with self.assertRaisesRegex(ValueError, "occurrences_r"):
+            target(z, hard_candidates=prepared_k1r1)
+        target.occurrences_r = 1
+
+        calls = 0
+
+        def virtual_hook(_module, _args, _output) -> None:
+            nonlocal calls
+            calls += 1
+
+        hooks = [
+            target.virtual_query.register_forward_hook(virtual_hook),
+            target.virtual_key.register_forward_hook(virtual_hook),
+        ]
+        try:
+            target.virtual_candidates = 1
+            output = target(z)
+        finally:
+            for hook in hooks:
+                hook.remove()
+        self.assertEqual(output.candidate_source_index.shape[-1], 1 * 1 + 1 + 1)
+        self.assertEqual(calls, 2)
+
+    def test_zero_neural_value_scale_skips_projection_and_reactivates(self) -> None:
+        torch.manual_seed(20260811)
+        model = self.make_model(neural_value_scale=0.0)
+        z = torch.randn(2, 9, 8)
+        positions = torch.tensor([[1, 6], [2, 8]])
+        projection_calls = 0
+
+        def projection_hook(_module, _args, _output) -> None:
+            nonlocal projection_calls
+            projection_calls += 1
+
+        hook = model.value_proj.register_forward_hook(projection_hook)
+        try:
+            for query_positions in (None, positions):
+                with self.subTest(scale=0.0, query_positions=query_positions):
+                    model.zero_grad(set_to_none=True)
+                    with patch.object(
+                        model,
+                        "_candidate_neural_values",
+                        side_effect=AssertionError("unexpected neural values"),
+                    ):
+                        output = model(z, query_positions=query_positions)
+                        output.updated.square().mean().backward()
+                        with torch.no_grad():
+                            model(z, query_positions=query_positions)
+                    for parameter in model.value_proj.parameters():
+                        self.assertIsNotNone(parameter.grad)
+                        assert parameter.grad is not None
+                        self.assertEqual(torch.count_nonzero(parameter.grad).item(), 0)
+            self.assertEqual(projection_calls, 0)
+
+            model.set_neural_value_scale(1.0)
+            for query_positions in (None, positions):
+                with self.subTest(scale=1.0, query_positions=query_positions):
+                    model.zero_grad(set_to_none=True)
+                    output = model(z, query_positions=query_positions)
+                    output.updated.square().mean().backward()
+                    for parameter in model.value_proj.parameters():
+                        self.assertIsNotNone(parameter.grad)
+                        assert parameter.grad is not None
+                        self.assertGreater(float(parameter.grad.abs().sum()), 0.0)
+            self.assertEqual(projection_calls, 2)
+        finally:
+            hook.remove()
+
+    def test_skipped_value_projection_zero_is_numerically_dormant(self) -> None:
+        model = self.make_model(neural_value_scale=0.0).to(dtype=torch.bfloat16)
+        symbolic = torch.randn(2, 3, 4, 8, dtype=torch.bfloat16)
+
+        for corruption in ("maximum", "non_finite"):
+            with self.subTest(corruption=corruption), torch.no_grad():
+                model.value_proj.weight.fill_(torch.finfo(torch.bfloat16).max)
+                if corruption == "non_finite":
+                    flat_weight = model.value_proj.weight.reshape(-1)
+                    flat_weight[0] = torch.nan
+                    flat_weight[1] = torch.inf
+                    flat_weight[2] = -torch.inf
+            model.zero_grad(set_to_none=True)
+            candidate_value = model._attach_skipped_value_projection_gradient(symbolic)
+            self.assertTrue(torch.equal(candidate_value, symbolic))
+            self.assertTrue(torch.isfinite(candidate_value).all())
+            candidate_value.float().sum().backward()
+            self.assertIsNotNone(model.value_proj.weight.grad)
+            assert model.value_proj.weight.grad is not None
+            self.assertEqual(
+                torch.count_nonzero(model.value_proj.weight.grad).item(), 0
+            )
+
+    def test_skipped_virtual_zero_is_numerically_dormant(self) -> None:
+        model = self.make_model(virtual_candidates=0).to(dtype=torch.bfloat16)
+        retrieved = torch.randn(2, 3, 8, dtype=torch.bfloat16)
+        updated = torch.randn(2, 3, 8, dtype=torch.bfloat16)
+
+        for corruption in ("maximum", "non_finite"):
+            with self.subTest(corruption=corruption), torch.no_grad():
+                for parameter in (
+                    model.virtual_query.weight,
+                    model.virtual_key.weight,
+                ):
+                    parameter.fill_(torch.finfo(torch.bfloat16).max)
+                    if corruption == "non_finite":
+                        flat_parameter = parameter.reshape(-1)
+                        flat_parameter[0] = torch.nan
+                        flat_parameter[1] = torch.inf
+                        flat_parameter[2] = -torch.inf
+            model.zero_grad(set_to_none=True)
+            actual_retrieved, actual_updated = model._attach_skipped_virtual_gradients(
+                retrieved, updated
+            )
+            self.assertTrue(torch.equal(actual_retrieved, retrieved))
+            self.assertTrue(torch.equal(actual_updated, updated))
+            self.assertTrue(torch.isfinite(actual_retrieved).all())
+            self.assertTrue(torch.isfinite(actual_updated).all())
+            (actual_retrieved.float().sum() + actual_updated.float().sum()).backward()
+            for parameter in (
+                model.virtual_query.weight,
+                model.virtual_key.weight,
+            ):
+                self.assertIsNotNone(parameter.grad)
+                assert parameter.grad is not None
+                self.assertEqual(torch.count_nonzero(parameter.grad).item(), 0)
+
+    def test_zero_neural_value_scale_matches_explicit_legacy_oracle(self) -> None:
+        torch.manual_seed(20260811)
+        base = self.make_model(
+            learned_residual_scale=1.0,
+            neural_value_scale=0.0,
+            value_gate_bias=0.0,
+        )
+        positions = torch.tensor([[1, 6], [2, 8]])
+
+        def legacy_oracle(
+            model: ROSA,
+            z: torch.Tensor,
+            query_positions: torch.Tensor | None,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, object]:
+            output = model(z, query_positions=query_positions)
+            non_null = output.candidate_mask & (output.candidate_kind != NULL_KIND)
+            next_position = torch.where(
+                non_null,
+                output.candidate_source_index + 1,
+                torch.zeros_like(output.candidate_source_index),
+            )
+            if query_positions is None:
+                symbol_sequence = (
+                    output.code_st[0] @ model.symbol_embedding_1.weight
+                    + output.code_st[1] @ model.symbol_embedding_2.weight
+                )
+                symbolic = _gather_sequence(symbol_sequence, next_position)
+                neural = model.value_proj(_gather_sequence(z, next_position))
+            else:
+                next_st1 = _gather_sequence(output.code_st[0], next_position)
+                next_st2 = _gather_sequence(output.code_st[1], next_position)
+                symbolic = (
+                    next_st1 @ model.symbol_embedding_1.weight
+                    + next_st2 @ model.symbol_embedding_2.weight
+                )
+                neural = _gather_sequence(model.value_proj(z), next_position)
+            symbolic = symbolic * non_null.unsqueeze(-1).to(z.dtype)
+            neural = neural * output.value_gate.unsqueeze(-1)
+            candidate = symbolic + model.neural_value_scale * neural
+            st_weights = output.hard_weights + (
+                output.soft_weights - output.soft_weights.detach()
+            )
+            retrieved = (st_weights.unsqueeze(-1) * candidate).sum(dim=-2)
+            updated = z + output.read_gate * model.out_proj(retrieved)
+            loss = (
+                updated.square().mean()
+                + retrieved.square().mean()
+                + output.value_gate.square().mean()
+            )
+            return updated, retrieved, loss, output
+
+        for query_positions in (None, positions):
+            with self.subTest(query_positions=query_positions):
+                optimized_model = copy.deepcopy(base)
+                oracle_model = copy.deepcopy(base)
+                z_optimized = torch.randn(2, 9, 8, requires_grad=True)
+                z_oracle = z_optimized.detach().clone().requires_grad_()
+
+                optimized = optimized_model(
+                    z_optimized, query_positions=query_positions
+                )
+                optimized_loss = (
+                    optimized.updated.square().mean()
+                    + optimized.retrieved.square().mean()
+                    + optimized.value_gate.square().mean()
+                )
+                oracle_updated, oracle_retrieved, oracle_loss, oracle = legacy_oracle(
+                    oracle_model, z_oracle, query_positions
+                )
+
+                self.assertTrue(torch.equal(optimized.updated, oracle_updated))
+                self.assertTrue(torch.equal(optimized.retrieved, oracle_retrieved))
+                self.assertTrue(torch.equal(optimized.value_gate, oracle.value_gate))
+                self.assertTrue(torch.equal(optimized_loss, oracle_loss))
+
+                optimized_loss.backward()
+                oracle_loss.backward()
+                torch.testing.assert_close(
+                    z_optimized.grad, z_oracle.grad, rtol=0, atol=0
+                )
+                for (optimized_name, optimized_parameter), (
+                    oracle_name,
+                    oracle_parameter,
+                ) in zip(
+                    optimized_model.named_parameters(),
+                    oracle_model.named_parameters(),
+                    strict=True,
+                ):
+                    self.assertEqual(optimized_name, oracle_name)
+                    self.assertIsNotNone(optimized_parameter.grad, optimized_name)
+                    self.assertIsNotNone(oracle_parameter.grad, oracle_name)
+                    torch.testing.assert_close(
+                        optimized_parameter.grad,
+                        oracle_parameter.grad,
+                        rtol=0,
+                        atol=0,
+                    )
+
+    def test_prepared_candidates_are_bit_exact_and_shared_without_rebuild(self) -> None:
+        torch.manual_seed(20260819)
+        baseline_model = self.make_model(
+            candidate_backend="python",
+            learned_residual_scale=1.0,
+            neural_value_scale=1.0,
+        )
+        prepared_model = copy.deepcopy(baseline_model)
+        second_consumer = copy.deepcopy(baseline_model)
+        tokens = torch.randint(6, (2, 13))
+        baseline_z = torch.randn(2, 13, 8, requires_grad=True)
+        prepared_z = baseline_z.detach().clone().requires_grad_()
+        logits_base = factor_logits_from_tokens(
+            tokens, (2, 3), hi=0.4, lo=-0.2, requires_grad=True
+        )
+        logits_prepared = (
+            logits_base[0].detach().clone().requires_grad_(),
+            logits_base[1].detach().clone().requires_grad_(),
+        )
+
+        baseline = baseline_model(baseline_z, code_logits=logits_base)
+        baseline_loss = baseline.updated.square().sum() + sum(
+            value.square().sum() for value in baseline.aux_losses.values()
+        )
+        baseline_loss.backward()
+
+        calls = 0
+        original = rosa._build_forward_hard_candidates
+
+        def counted(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return original(*args, **kwargs)
+
+        with patch("rosa._build_forward_hard_candidates", side_effect=counted):
+            hard_tokens = prepared_model.encode(prepared_z, logits_prepared)[2]
+            prepared = prepared_model.prepare_hard_candidates(hard_tokens)
+            self.assertIsInstance(prepared, PreparedHardCandidates)
+            self.assertFalse(prepared.hard_tokens.requires_grad)
+            self.assertEqual(calls, 1)
+            actual = prepared_model(
+                prepared_z, code_logits=logits_prepared, hard_candidates=prepared
+            )
+            # Different logits with the same argmax remain valid for another model.
+            shifted_logits = tuple(value + 0.125 for value in logits_prepared)
+            shared = second_consumer(
+                prepared_z.detach(),
+                code_logits=shifted_logits,
+                hard_candidates=prepared,
+            )
+            self.assertEqual(calls, 1)
+
+        for name in baseline.__dataclass_fields__:
+            self.assert_nested_equal(
+                getattr(actual, name), getattr(baseline, name), name
+            )
+        self.assertTrue(torch.equal(shared.hard_tokens, actual.hard_tokens))
+        self.assertTrue(
+            torch.equal(shared.candidate_source_index, actual.candidate_source_index)
+        )
+        actual_loss = actual.updated.square().sum() + sum(
+            value.square().sum() for value in actual.aux_losses.values()
+        )
+        self.assertTrue(torch.equal(actual_loss, baseline_loss))
+        actual_loss.backward()
+        prepared_z_grad = prepared_z.grad
+        baseline_z_grad = baseline_z.grad
+        assert prepared_z_grad is not None
+        assert baseline_z_grad is not None
+        self.assertTrue(torch.equal(prepared_z_grad, baseline_z_grad))
+        for actual_logit, baseline_logit in zip(
+            logits_prepared, logits_base, strict=True
+        ):
+            actual_logit_grad = actual_logit.grad
+            baseline_logit_grad = baseline_logit.grad
+            assert actual_logit_grad is not None
+            assert baseline_logit_grad is not None
+            self.assertTrue(torch.equal(actual_logit_grad, baseline_logit_grad))
+        for (_, actual_parameter), (_, baseline_parameter) in zip(
+            prepared_model.named_parameters(),
+            baseline_model.named_parameters(),
+            strict=True,
+        ):
+            self.assertEqual(
+                actual_parameter.grad is None, baseline_parameter.grad is None
+            )
+            actual_parameter_grad = actual_parameter.grad
+            baseline_parameter_grad = baseline_parameter.grad
+            if actual_parameter_grad is not None:
+                assert baseline_parameter_grad is not None
+                self.assertTrue(
+                    torch.equal(actual_parameter_grad, baseline_parameter_grad)
+                )
+
+    def test_prepared_candidates_combine_with_query_positions(self) -> None:
+        model = self.make_model(candidate_backend="python", learned_residual_scale=1.0)
+        z = torch.randn(2, 11, 8)
+        tokens = torch.randint(6, (2, 11))
+        logits = factor_logits_from_tokens(tokens, (2, 3))
+        prepared = model.prepare_hard_candidates(model.encode(z, logits)[2])
+        positions = torch.tensor([[1, 5, 10], [0, 4, 8]])
+        expected = model(z, code_logits=logits, query_positions=positions)
+        with patch(
+            "rosa._build_forward_hard_candidates",
+            side_effect=AssertionError("unexpected rebuild"),
+        ):
+            actual = model(
+                z,
+                code_logits=logits,
+                query_positions=positions,
+                hard_candidates=prepared,
+            )
+        for name in expected.__dataclass_fields__:
+            self.assert_nested_equal(
+                getattr(actual, name), getattr(expected, name), name
+            )
+
+    def test_prepared_candidates_strict_rejections(self) -> None:
+        model = self.make_model(candidate_backend="python")
+        z = torch.randn(2, 9, 8)
+        tokens = torch.randint(6, (2, 9))
+        logits = factor_logits_from_tokens(tokens, (2, 3))
+
+        def prepare():
+            return model.prepare_hard_candidates(model.encode(z, logits)[2])
+
+        def forged(field, replacement):
+            base = prepare()
+            candidates = copy.deepcopy(base.candidates)
+            setattr(candidates, field, replacement)
+            snapshot = base.hard_tokens.clone()
+            tensors = (snapshot,) + tuple(
+                getattr(candidates, name) for name in candidates.__dataclass_fields__
+            )
+            return PreparedHardCandidates(
+                snapshot,
+                candidates,
+                base.suffix_k,
+                base.occurrences_r,
+                base.candidate_backend,
+                base.shape,
+                base.device,
+                tuple(tensor._version for tensor in tensors),
+                tuple(id(tensor) for tensor in tensors),
+                tuple(tensor.clone() for tensor in tensors),
+            )
+
+        with self.assertRaisesRegex(TypeError, "PreparedHardCandidates"):
+            model(z, code_logits=logits, hard_candidates=prepare().candidates)  # type: ignore[arg-type]
+        with self.assertRaises(FrozenInstanceError):
+            prepare().suffix_k = 99  # type: ignore[misc]
+
+        stale_logits = factor_logits_from_tokens(tokens.clone(), (2, 3))
+        # Force one encoded token to differ without changing shapes.
+        stale_logits[0].data[0, 0].fill_(-20.0)
+        stale_id = (int(tokens[0, 0] // 3) + 1) % 2
+        stale_logits[0].data[0, 0, stale_id] = 20.0
+        with self.assertRaisesRegex(ValueError, "stale"):
+            model(z, code_logits=stale_logits, hard_candidates=prepare())
+
+        for attribute, value, message in (
+            ("suffix_k", model.suffix_k + 1, "suffix_k"),
+            ("occurrences_r", model.occurrences_r + 1, "occurrences_r"),
+            ("candidate_backend", "stateful", "candidate_backend"),
+        ):
+            consumer = copy.deepcopy(model)
+            setattr(consumer, attribute, value)
+            with self.assertRaisesRegex(ValueError, message):
+                consumer(z, code_logits=logits, hard_candidates=prepare())
+
+        short_z = z[:, :-1]
+        short_logits = tuple(value[:, :-1] for value in logits)
+        with self.assertRaisesRegex(ValueError, "B/N"):
+            model(short_z, code_logits=short_logits, hard_candidates=prepare())
+
+        with self.assertRaisesRegex(ValueError, "source_index.*shape"):
+            model(
+                z,
+                code_logits=logits,
+                hard_candidates=forged(
+                    "source_index", torch.zeros(2, 9, 14, dtype=torch.long)
+                ),
+            )
+        with self.assertRaisesRegex(TypeError, "match_length.*dtype"):
+            model(
+                z,
+                code_logits=logits,
+                hard_candidates=forged(
+                    "match_length", torch.zeros(2, 9, 15, dtype=torch.float32)
+                ),
+            )
+        with self.assertRaisesRegex(ValueError, "source_index.*device"):
+            model(
+                z,
+                code_logits=logits,
+                hard_candidates=forged(
+                    "source_index",
+                    torch.empty(2, 9, 15, dtype=torch.long, device="meta"),
+                ),
+            )
+
+        for field, replacement in (
+            ("source_index", torch.zeros(2, 9, 1, dtype=torch.long)),
+            ("match_length", torch.zeros(2, 9, 15, dtype=torch.float32)),
+        ):
+            prepared = prepare()
+            setattr(prepared.candidates, field, replacement)
+            with self.assertRaises((TypeError, ValueError)):
+                model(z, code_logits=logits, hard_candidates=prepared)
+
+        prepared = prepare()
+        prepared.candidates.mask.logical_not_()
+        with self.assertRaisesRegex(ValueError, "mutated"):
+            model(z, code_logits=logits, hard_candidates=prepared)
+        prepared = prepare()
+        prepared.candidates.mask.data.logical_not_()
+        with self.assertRaisesRegex(ValueError, "mutated"):
+            model(z, code_logits=logits, hard_candidates=prepared)
+        prepared = prepare()
+        prepared.candidates.source_index.numpy()[0, 0, 0] = 42
+        with self.assertRaisesRegex(ValueError, "mutated"):
+            model(z, code_logits=logits, hard_candidates=prepared)
+        prepared = prepare()
+        prepared.hard_tokens.add_(1)
+        with self.assertRaisesRegex(ValueError, "mutated"):
+            model(z, code_logits=logits, hard_candidates=prepared)
+
+        if torch.cuda.is_available():
+            cuda_model = copy.deepcopy(model).cuda()
+            with self.assertRaisesRegex(ValueError, "device"):
+                cuda_model(
+                    z.cuda(),
+                    code_logits=tuple(value.cuda() for value in logits),
+                    hard_candidates=prepare(),
+                )
+
+    def test_prepared_candidates_cover_all_metadata_guards(self) -> None:
+        model = self.make_model(candidate_backend="python")
+        tokens = torch.zeros((1, 3), dtype=torch.long)
+
+        for invalid, error_type, message in (
+            (object(), TypeError, "must be a Tensor"),
+            (tokens.float(), TypeError, "dtype torch.long"),
+            (tokens[0], ValueError, r"\[B, N\]"),
+            (torch.empty((1, 0), dtype=torch.long), ValueError, "dimensions"),
+            (
+                torch.empty((1, 3), dtype=torch.long, device="meta"),
+                ValueError,
+                "same device",
+            ),
+        ):
+            with (
+                self.subTest(message=message),
+                self.assertRaisesRegex(error_type, message),
+            ):
+                model.prepare_hard_candidates(invalid)  # type: ignore[arg-type]
+
+        def prepare() -> PreparedHardCandidates:
+            return model.prepare_hard_candidates(tokens)
+
+        with self.assertRaisesRegex(ValueError, "device does not match"):
+            model._validate_prepared_hard_candidates(
+                replace(prepare(), device=torch.device("meta")), tokens
+            )
+
+        non_tensor_field = prepare()
+        non_tensor_field.candidates.source_index = object()  # type: ignore[assignment]
+        with self.assertRaisesRegex(TypeError, "fields must all be Tensors"):
+            model._validate_prepared_hard_candidates(non_tensor_field, tokens)
+
+        with self.assertRaisesRegex(ValueError, "metadata is invalid"):
+            model._validate_prepared_hard_candidates(
+                replace(prepare(), tensor_versions=()), tokens
+            )
+        with self.assertRaisesRegex(ValueError, "hard_tokens metadata"):
+            model._validate_prepared_hard_candidates(
+                replace(prepare(), hard_tokens=tokens.float()), tokens
+            )
+
+        candidate_type = prepare()
+        original_tensors = model._prepared_tensors(candidate_type)
+        candidate_type.candidates.source_index = object()  # type: ignore[assignment]
+        with (
+            patch.object(model, "_prepared_tensors", return_value=original_tensors),
+            self.assertRaisesRegex(TypeError, "source_index.*Tensor"),
+        ):
+            model._validate_prepared_hard_candidates(candidate_type, tokens)
+
+        snapshots = prepare()
+        with self.assertRaisesRegex(TypeError, "snapshots must be Tensors"):
+            model._validate_prepared_hard_candidates(
+                replace(
+                    snapshots,
+                    _tensor_snapshots=(object(), *snapshots._tensor_snapshots[1:]),
+                ),
+                tokens,
+            )
+        with self.assertRaisesRegex(ValueError, "tensor metadata is invalid"):
+            model._validate_prepared_hard_candidates(
+                replace(
+                    snapshots,
+                    _tensor_snapshots=(
+                        torch.empty(0, dtype=torch.long),
+                        *snapshots._tensor_snapshots[1:],
+                    ),
+                ),
+                tokens,
+            )
+
+    def test_selected_builder_optional_dependency_fallbacks(self) -> None:
+        tokens = torch.tensor([[0, 1, 0]])
+        positions = torch.tensor([[2, 0]])
+
+        with (
+            patch(
+                "rosa._build_stateful_hard_candidates_selected",
+                side_effect=ModuleNotFoundError("unexpected", name="unexpected"),
+            ),
+            self.assertRaises(ModuleNotFoundError),
+        ):
+            _build_forward_hard_candidates_selected(tokens, positions, 2, 1, "auto")
+
+        missing_numba = ModuleNotFoundError("missing numba", name="numba")
+        with patch(
+            "rosa._build_stateful_hard_candidates_selected", side_effect=missing_numba
+        ):
+            with self.assertRaisesRegex(RuntimeError, "numba.*extra"):
+                _build_forward_hard_candidates_selected(
+                    tokens, positions, 2, 1, "stateful"
+                )
+            actual = _build_forward_hard_candidates_selected(
+                tokens, positions, 2, 1, "auto"
+            )
+        expected = _build_forward_hard_candidates_selected(
+            tokens, positions, 2, 1, "python"
+        )
+        for name in expected.__dataclass_fields__:
+            self.assertTrue(torch.equal(getattr(actual, name), getattr(expected, name)))
+
+    def test_prepared_candidates_have_explicit_external_ownership(self) -> None:
+        model = self.make_model(candidate_backend="python")
+        z = torch.randn(1, 8, 8)
+        tokens = torch.randint(6, (1, 8))
+        logits = factor_logits_from_tokens(tokens, (2, 3))
+        prepared = model.prepare_hard_candidates(model.encode(z, logits)[2])
+        state_keys = set(model.state_dict())
+        self.assertFalse(
+            any("prepared" in key or "candidate" in key for key in state_keys)
+        )
+        copied_model = copy.deepcopy(model)
+        copied_prepared = copy.deepcopy(prepared)
+        self.assertIsNot(copied_prepared.hard_tokens, prepared.hard_tokens)
+        copied_model(z, code_logits=logits, hard_candidates=copied_prepared)
+        model.to("cpu")
+        self.assertEqual(prepared.device.type, "cpu")
+        model(z, code_logits=logits, hard_candidates=prepared)
+
+    def test_prepared_candidates_support_inference_tensors(self) -> None:
+        model = self.make_model(candidate_backend="python")
+        z = torch.randn(1, 8, 8)
+        tokens = torch.randint(6, (1, 8))
+        logits = factor_logits_from_tokens(tokens, (2, 3))
+        with torch.inference_mode():
+            hard_tokens = model.encode(z, logits)[2]
+            prepared = model.prepare_hard_candidates(hard_tokens)
+            copied = copy.deepcopy(prepared)
+            expected = model(z, code_logits=logits)
+            actual = model(z, code_logits=logits, hard_candidates=copied)
+        for name in expected.__dataclass_fields__:
+            self.assert_nested_equal(
+                getattr(actual, name), getattr(expected, name), name
+            )
+
+    def test_query_positions_validation_and_keyword_only_signature(self) -> None:
+        model = self.make_model(candidate_backend="python")
+        z = torch.randn(2, 7, 8)
+        with self.assertRaisesRegex(TypeError, "must be a Tensor"):
+            model(z, query_positions=[[1], [2]])  # type: ignore[arg-type]
+        with self.assertRaisesRegex(TypeError, "dtype torch.long"):
+            model(z, query_positions=torch.zeros(2, 1))
+        for positions, message in (
+            (torch.zeros(2, dtype=torch.long), r"\[B, Q\]"),
+            (torch.zeros(1, 1, dtype=torch.long), r"\[B, Q\]"),
+            (torch.empty(2, 0, dtype=torch.long), "at least one"),
+            (torch.tensor([[0, 7], [1, 2]]), r"\[0, N\)"),
+            (torch.tensor([[1, 1], [2, 3]]), "unique"),
+        ):
+            with (
+                self.subTest(message=message),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                model(z, query_positions=positions)
+        with self.assertRaises(TypeError):
+            model(z, None, None, torch.tensor([[1], [2]]))
+        with self.assertRaisesRegex(ValueError, "same device"):
+            model(
+                z,
+                query_positions=torch.empty((2, 1), dtype=torch.long, device="meta"),
+            )
+
+    def test_private_zero_virtual_and_query_only_branch_edges(self) -> None:
+        no_virtual = self.make_model(virtual_candidates=0)
+        z = torch.randn(1, 4, 8)
+        source, mask, score = no_virtual._virtual_candidates(
+            z,
+            torch.empty((1, 4, 0), dtype=torch.long),
+            torch.empty((1, 4, 0), dtype=torch.bool),
+        )
+        self.assertEqual(source.shape, (1, 4, 0))
+        self.assertEqual(mask.shape, source.shape)
+        self.assertEqual(score.shape, source.shape)
+
+        one_anchor = self.make_model(
+            virtual_candidates=0,
+            dense_recent_candidates=1,
+            sparse_old_candidates=1,
+            sparse_old_pool_size=1,
+            soft_candidates_forward=True,
+        )
+        positions = torch.tensor([[3, 1, 0, 2]])
+        output = one_anchor(z, query_positions=positions)
+        self.assertEqual(output.updated.shape, z.shape)
+
+    def test_stateful_query_only_uses_selected_prefill_builder(self) -> None:
+        from rosa._stateful_candidates_numba import prefill_candidates_selected
+
+        model = self.make_model(
+            candidate_backend="stateful", learned_residual_scale=1.0
+        )
+        z = torch.randn(2, 9, 8, requires_grad=True)
+        positions = torch.tensor([[8, 0, 4], [1, 8, 0]])
+        with (
+            patch(
+                "rosa._stateful_candidates_numba.prefill_candidates",
+                side_effect=AssertionError("full stateful prefill"),
+            ),
+            patch(
+                "rosa._stateful_candidates_numba.prefill_candidates_selected",
+                wraps=prefill_candidates_selected,
+            ) as selected,
+        ):
+            output = model(z, query_positions=positions)
+            loss = output.updated.square().mean() + sum(output.aux_losses.values())
+            loss.backward()
+        selected.assert_called_once()
+        self.assertEqual(output.candidate_source_index.shape[:2], (2, 9))
+        self.assertIsNotNone(z.grad)
+
+    def test_query_positions_matches_full_gradients_and_sentinels(self) -> None:
+        devices = [torch.device("cpu")]
+        if torch.cuda.is_available():
+            devices.append(torch.device("cuda"))
+        discrete_fields = (
+            "hard_tokens",
+            "candidate_source_index",
+            "candidate_kind",
+            "candidate_mask",
+            "chosen_candidate",
+            "chosen_source_index",
+            "chosen_token",
+            "chosen_match_length",
+            "chosen_is_virtual",
+            "hard_rosa_source_index",
+            "hard_rosa_predicted_tokens",
+            "hard_rosa_match_length",
+        )
+        float_fields = (
+            "updated",
+            "retrieved",
+            "candidate_scores",
+            "soft_weights",
+            "hard_weights",
+            "soft_match_score",
+            "read_gate",
+            "value_gate",
+        )
+        for device in devices:
+            for backend in ("python", "stateful"):
+                with self.subTest(device=device, backend=backend):
+                    torch.manual_seed(20260819)
+                    full_model = self.make_model(
+                        candidate_backend=backend,
+                        learned_residual_scale=1.0,
+                        neural_value_scale=1.0,
+                        dense_recent_candidates=2,
+                        sparse_old_candidates=1,
+                        sparse_old_pool_size=4,
+                    ).to(device)
+                    query_model = copy.deepcopy(full_model)
+                    z_full = torch.randn(2, 17, 8, device=device, requires_grad=True)
+                    z_query = z_full.detach().clone().requires_grad_()
+                    positions = torch.tensor([[1, 6, 15], [2, 9, 16]], device=device)
+                    full = full_model(z_full)
+                    query = query_model(z_query, query_positions=positions)
+                    batch = torch.arange(2, device=device).unsqueeze(1)
+                    for name in discrete_fields:
+                        expected = getattr(full, name)
+                        actual = getattr(query, name)
+                        if name != "hard_tokens":
+                            expected = expected[batch, positions]
+                            actual = actual[batch, positions]
+                        self.assertTrue(torch.equal(actual, expected), name)
+                    for name in float_fields:
+                        expected = getattr(full, name)[batch, positions]
+                        actual = getattr(query, name)[batch, positions]
+                        torch.testing.assert_close(
+                            actual, expected, rtol=2e-6, atol=2e-7
+                        )
+
+                    query_mask = torch.zeros((2, 17), dtype=torch.bool, device=device)
+                    query_mask.scatter_(1, positions, True)
+                    non_query = ~query_mask
+                    self.assertTrue(
+                        torch.equal(query.updated[non_query], z_query[non_query])
+                    )
+                    for name in ("retrieved", "soft_weights", "hard_weights"):
+                        self.assertTrue(
+                            torch.count_nonzero(getattr(query, name)[non_query]) == 0
+                        )
+                    self.assertTrue(
+                        torch.isneginf(query.candidate_scores[non_query]).all()
+                    )
+                    self.assertTrue(
+                        (query.candidate_source_index[non_query] == -1).all()
+                    )
+                    self.assertTrue((query.candidate_kind[non_query] == -1).all())
+                    self.assertFalse(query.candidate_mask[non_query].any())
+                    for name in (
+                        "chosen_candidate",
+                        "chosen_source_index",
+                        "chosen_token",
+                        "hard_rosa_source_index",
+                        "hard_rosa_predicted_tokens",
+                    ):
+                        self.assertTrue(
+                            (getattr(query, name)[non_query] == -1).all(), name
+                        )
+                    for name in (
+                        "chosen_match_length",
+                        "hard_rosa_match_length",
+                        "soft_match_score",
+                        "read_gate",
+                        "value_gate",
+                    ):
+                        self.assertTrue(
+                            torch.count_nonzero(getattr(query, name)[non_query]) == 0,
+                            name,
+                        )
+
+                    def selected_loss(output):
+                        return (
+                            output.updated[batch, positions].square().mean()
+                            + output.retrieved[batch, positions].square().mean()
+                            + output.soft_weights[batch, positions].square().mean()
+                            + sum(item.square().mean() for item in output.code_soft)
+                        )
+
+                    selected_loss(full).backward()
+                    selected_loss(query).backward()
+                    torch.testing.assert_close(
+                        z_query.grad, z_full.grad, rtol=2e-6, atol=2e-7
+                    )
+                    for (_, full_parameter), (_, query_parameter) in zip(
+                        full_model.named_parameters(),
+                        query_model.named_parameters(),
+                        strict=True,
+                    ):
+                        self.assertEqual(
+                            full_parameter.grad is None, query_parameter.grad is None
+                        )
+                        if full_parameter.grad is not None:
+                            torch.testing.assert_close(
+                                query_parameter.grad,
+                                full_parameter.grad,
+                                rtol=2e-6,
+                                atol=2e-7,
+                            )
+
+    def test_query_positions_full_arange_is_bit_exact_legacy_route(self) -> None:
+        model = self.make_model(candidate_backend="python")
+        z_a = torch.randn(2, 9, 8)
+        z_b = torch.randn_like(z_a)
+        legacy = model(z_a, z_b, None)
+        positions = torch.arange(9).expand(2, -1)
+        query = model(z_a, z_b, None, query_positions=positions)
+        for name in legacy.__dataclass_fields__:
+            self.assert_nested_equal(getattr(query, name), getattr(legacy, name), name)
 
     def test_python_and_stateful_backends_match_all_fields_outputs_and_gradients(
         self,
@@ -941,6 +1876,90 @@ class TestROSASemantics(unittest.TestCase):
         assert captured is not None
         for name in hard.__dataclass_fields__:
             self.assertIs(getattr(hard, name), getattr(captured, name), name)
+
+    def test_stateful_one_shot_releases_native_state_and_storage(self) -> None:
+        try:
+            import rosa_native_step
+        except ModuleNotFoundError:
+            self.skipTest("native companion is unavailable")
+        if getattr(rosa_native_step, "NativeCandidateState", None) is None:
+            self.skipTest("native candidate backend is unavailable")
+
+        from rosa._stateful_candidates_numba import (
+            init_candidate_state,
+            prefill_candidates,
+        )
+
+        tokens = torch.tensor([[0, 1, 0, 2, 0, 1]], dtype=torch.long)
+        expected = build_hard_candidates(tokens, suffix_k=3, occurrences_r=2)
+        state_ref = None
+        array_refs = []
+        native_used = False
+
+        def tracked_initialize(*args, **kwargs):
+            nonlocal state_ref, array_refs
+            state = init_candidate_state(*args, **kwargs)
+            state_ref = weakref.ref(state)
+            array_refs = [
+                weakref.ref(value)
+                for value in vars(state).values()
+                if isinstance(value, np.ndarray)
+            ]
+            return state
+
+        def tracked_prefill(state, full_tokens):
+            nonlocal native_used
+            candidates = prefill_candidates(state, full_tokens)
+            native_used = state.native_state not in (None, False)
+            return candidates
+
+        with (
+            patch(
+                "rosa._stateful_candidates_numba.init_candidate_state",
+                side_effect=tracked_initialize,
+            ),
+            patch(
+                "rosa._stateful_candidates_numba.prefill_candidates",
+                side_effect=tracked_prefill,
+            ),
+        ):
+            actual = rosa._build_stateful_hard_candidates(tokens, 3, 2)
+
+        self.assertTrue(native_used)
+        for name in expected.__dataclass_fields__:
+            self.assertTrue(
+                torch.equal(getattr(actual, name), getattr(expected, name)), name
+            )
+        gc.collect()
+        assert state_ref is not None
+        self.assertIsNone(state_ref())
+        self.assertTrue(array_refs)
+        self.assertTrue(all(array_ref() is None for array_ref in array_refs))
+
+    def test_stateful_one_shot_detaches_native_state_on_exception(self) -> None:
+        from rosa._stateful_candidates_numba import init_candidate_state
+
+        state = init_candidate_state(1, 3, suffix_k=2, occurrences_r=2)
+
+        class NativeOwner:
+            def __init__(self, candidate_state):
+                self.candidate_state = candidate_state
+
+        native = NativeOwner(state)
+        state.native_state = native
+        with (
+            patch(
+                "rosa._stateful_candidates_numba.init_candidate_state",
+                return_value=state,
+            ),
+            patch(
+                "rosa._stateful_candidates_numba.prefill_candidates",
+                side_effect=RuntimeError("prefill failed"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "prefill failed"),
+        ):
+            rosa._build_stateful_hard_candidates(torch.tensor([[0, 1, 0]]), 2, 2)
+        self.assertIsNone(state.native_state)
 
     def test_stateful_full_sequence_preserves_scalar_batch_squeeze(self) -> None:
         tokens = torch.tensor([0, 1, 0, 2, 0, 1], dtype=torch.long)
