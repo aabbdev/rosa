@@ -3,7 +3,6 @@ from __future__ import annotations
 import gc
 import os
 import threading
-import types
 import weakref
 from concurrent.futures import ThreadPoolExecutor
 from itertools import product
@@ -20,6 +19,16 @@ from rosa._stateful_candidates_numba import (
     prefill_candidates,
     reset_candidates_masked,
 )
+
+
+def nonweak_owner(source: object) -> object:
+    class NonWeakOwner:
+        __slots__ = tuple(vars(source))
+
+    owner = NonWeakOwner()
+    for name, value in vars(source).items():
+        setattr(owner, name, value)
+    return owner
 
 
 def assert_step_equal(actual: tuple[np.ndarray, ...], expected: CandidateStep) -> None:
@@ -314,8 +323,14 @@ def main() -> None:
     assert cyclic_owner_ref() is None
     assert cyclic_wrapper_ref() is None
 
-    nonweak_owner = types.SimpleNamespace(**vars(init_candidate_state(1, 2)))
-    nonweak = rosa_native_step.NativeCandidateState(nonweak_owner)
+    nonweak_state = nonweak_owner(init_candidate_state(1, 2))
+    try:
+        weakref.ref(nonweak_state)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("slotted owner unexpectedly supports weak references")
+    nonweak = rosa_native_step.NativeCandidateState(nonweak_state)
     nonweak.step(np.array([11], dtype=np.int64))
     assert nonweak.position == 1
 

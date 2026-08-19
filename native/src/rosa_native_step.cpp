@@ -273,6 +273,10 @@ py::object make_owner_weakref(py::handle owner) {
   PyObject *reference = PyWeakref_NewRef(owner.ptr(), nullptr);
   if (reference != nullptr)
     return py::reinterpret_steal<py::object>(reference);
+  if (PyErr_ExceptionMatches(PyExc_TypeError)) {
+    PyErr_Clear();
+    return py::none();
+  }
   throw py::error_already_set();
 }
 

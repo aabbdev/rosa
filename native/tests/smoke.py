@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import gc
-import types
 import weakref
 
 import numpy as np
@@ -10,6 +9,16 @@ import torch
 
 from rosa._stateful_numba import _forward_step, _init_inference_state, _prefill
 from rosa.ragged import RaggedInferenceState
+
+
+def nonweak_owner(source: object) -> object:
+    class NonWeakOwner:
+        __slots__ = tuple(vars(source))
+
+    owner = NonWeakOwner()
+    for name, value in vars(source).items():
+        setattr(owner, name, value)
+    return owner
 
 
 def assert_same_initialized_state(oracle: object, candidate: object) -> None:
@@ -109,8 +118,14 @@ def main() -> None:
     assert cyclic_owner_ref() is None
     assert cyclic_wrapper_ref() is None
 
-    nonweak_owner = types.SimpleNamespace(**vars(_init_inference_state(1, 2)))
-    nonweak = rosa_native_step.NativeState(nonweak_owner)
+    nonweak_state = nonweak_owner(_init_inference_state(1, 2))
+    try:
+        weakref.ref(nonweak_state)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("slotted owner unexpectedly supports weak references")
+    nonweak = rosa_native_step.NativeState(nonweak_state)
     nonweak.step(np.array([11], dtype=np.int64))
     assert nonweak.position == 1
 
