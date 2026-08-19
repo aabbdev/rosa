@@ -135,6 +135,28 @@ def main() -> None:
         for actual, expected in zip(prefill_arrays, prefill_allocating, strict=True)
     )
 
+    selected_queries = np.array([[2, 0], [1, 2]], dtype=np.int64)
+    selected_state = rosa_native_step.NativeCandidateState(
+        init_candidate_state(2, 4, suffix_k=2, occurrences_r=2)
+    )
+    selected = selected_state.prefill_selected(prefix, selected_queries)
+    batch = np.arange(2)[:, None]
+    assert all(
+        np.array_equal(actual, expected[batch, selected_queries])
+        for actual, expected in zip(selected, prefill_allocating, strict=True)
+    )
+    continuation_tokens = np.array([2, 5], dtype=np.int64)
+    selected_tail = selected_state.step(continuation_tokens)
+    full_state = rosa_native_step.NativeCandidateState(
+        init_candidate_state(2, 4, suffix_k=2, occurrences_r=2)
+    )
+    full_state.prefill(prefix)
+    full_tail = full_state.step(continuation_tokens)
+    assert all(
+        np.array_equal(actual, expected)
+        for actual, expected in zip(selected_tail, full_tail, strict=True)
+    )
+
     # Pools are lazy, never useful below the prefill threshold, and invalid
     # thread limits (including signed strings) select the serial fallback.
     small_pool = rosa_native_step.NativeCandidateState(init_candidate_state(3, 4))

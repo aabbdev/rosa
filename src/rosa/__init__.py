@@ -41,6 +41,7 @@ __all__ = [
     "init_candidate_buffers",
     "init_inference_state",
     "prefill",
+    "prefill_candidates_selected",
     "reference_rosa",
 ]
 
@@ -511,6 +512,81 @@ def _build_forward_hard_candidates(
                 "stateful candidate backend requires the 'numba' extra"
             ) from error
         return build_hard_candidates(tokens, suffix_k, occurrences_r)
+
+
+def _select_hard_candidates(
+    candidates: HardCandidates, query_positions: Tensor
+) -> HardCandidates:
+    """Gather a full candidate object into caller-specified query order."""
+
+    batch = torch.arange(
+        query_positions.shape[0], device=query_positions.device
+    ).unsqueeze(1)
+    return HardCandidates(
+        *(
+            value[batch, query_positions]
+            for value in (
+                getattr(candidates, name)
+                for name in HardCandidates.__dataclass_fields__
+            )
+        )
+    )
+
+
+def _build_stateful_hard_candidates_selected(
+    tokens: Tensor,
+    query_positions: Tensor,
+    suffix_k: int,
+    occurrences_r: int,
+) -> HardCandidates:
+    """Ingest a full context but materialize stateful candidates only for Q."""
+
+    from ._stateful_candidates_numba import init_candidate_state as initialize
+    from ._stateful_candidates_numba import prefill_candidates_selected
+
+    batch_size, sequence_length = tokens.shape
+    state = initialize(
+        batch_size,
+        sequence_length,
+        suffix_k=suffix_k,
+        occurrences_r=occurrences_r,
+    )
+    try:
+        candidates = prefill_candidates_selected(state, tokens, query_positions)
+        return HardCandidates(
+            *(getattr(candidates, name) for name in HardCandidates.__dataclass_fields__)
+        )
+    finally:
+        state.close()
+
+
+def _build_forward_hard_candidates_selected(
+    tokens: Tensor,
+    query_positions: Tensor,
+    suffix_k: int,
+    occurrences_r: int,
+    backend: CandidateBackend,
+) -> HardCandidates:
+    """Build Q-only candidates, allowing Python to use full-build plus gather."""
+
+    if backend == "python":
+        return _select_hard_candidates(
+            build_hard_candidates(tokens, suffix_k, occurrences_r), query_positions
+        )
+    try:
+        return _build_stateful_hard_candidates_selected(
+            tokens, query_positions, suffix_k, occurrences_r
+        )
+    except ModuleNotFoundError as error:
+        if error.name not in {"numba", "numpy"}:
+            raise
+        if backend == "stateful":
+            raise RuntimeError(
+                "stateful candidate backend requires the 'numba' extra"
+            ) from error
+        return _select_hard_candidates(
+            build_hard_candidates(tokens, suffix_k, occurrences_r), query_positions
+        )
 
 
 def _virtual_pool_single(i: int, pool_size: int) -> list[int]:
@@ -1344,9 +1420,11 @@ class ROSA(nn.Module):
         """Run candidate activations only at selected sequence positions."""
 
         (soft1, soft2), (st1, st2), hard_tokens = self.encode(z_a, code_logits)
+        selected_hard = hard_candidates is None
         hard = (
-            _build_forward_hard_candidates(
+            _build_forward_hard_candidates_selected(
                 hard_tokens,
+                query_positions,
                 self.suffix_k,
                 self.occurrences_r,
                 self.candidate_backend,
@@ -1357,10 +1435,24 @@ class ROSA(nn.Module):
         bsz, n, _ = z_a.shape
         queries = query_positions.shape[1]
         z_query = _gather_sequence(z_a, query_positions)
-        exact_source = _gather_sequence(hard.source_index, query_positions)
-        exact_mask = _gather_sequence(hard.mask, query_positions)
-        exact_match_length = _gather_sequence(hard.match_length, query_positions)
-        exact_frequency = _gather_sequence(hard.frequency, query_positions)
+        exact_source = (
+            hard.source_index
+            if selected_hard
+            else _gather_sequence(hard.source_index, query_positions)
+        )
+        exact_mask = (
+            hard.mask if selected_hard else _gather_sequence(hard.mask, query_positions)
+        )
+        exact_match_length = (
+            hard.match_length
+            if selected_hard
+            else _gather_sequence(hard.match_length, query_positions)
+        )
+        exact_frequency = (
+            hard.frequency
+            if selected_hard
+            else _gather_sequence(hard.frequency, query_positions)
+        )
         exact_slots = exact_source.shape[-1]
 
         if self.virtual_candidates:
@@ -1534,7 +1626,11 @@ class ROSA(nn.Module):
         candidate_number = torch.arange(source.shape[-1], device=z_a.device).view(
             1, 1, -1
         )
-        exact_rosa_slot = hard.rosa_slot.gather(1, query_positions).unsqueeze(-1)
+        exact_rosa_slot = (
+            hard.rosa_slot
+            if selected_hard
+            else hard.rosa_slot.gather(1, query_positions)
+        ).unsqueeze(-1)
         is_rosa = ((candidate_number == exact_rosa_slot) & (exact_rosa_slot >= 0)).to(
             z_a.dtype
         )
@@ -1704,19 +1800,25 @@ class ROSA(nn.Module):
                 chosen_kind == VIRTUAL_KIND, query_positions, n, False
             ),
             hard_rosa_source_index=scatter(
-                hard.rosa_source_index.gather(1, query_positions),
+                hard.rosa_source_index
+                if selected_hard
+                else hard.rosa_source_index.gather(1, query_positions),
                 query_positions,
                 n,
                 -1,
             ),
             hard_rosa_predicted_tokens=scatter(
-                hard.rosa_predicted_tokens.gather(1, query_positions),
+                hard.rosa_predicted_tokens
+                if selected_hard
+                else hard.rosa_predicted_tokens.gather(1, query_positions),
                 query_positions,
                 n,
                 -1,
             ),
             hard_rosa_match_length=scatter(
-                hard.rosa_match_length.gather(1, query_positions),
+                hard.rosa_match_length
+                if selected_hard
+                else hard.rosa_match_length.gather(1, query_positions),
                 query_positions,
                 n,
                 0,
@@ -2376,6 +2478,16 @@ def forward_candidates_step_into(state: object, tokens: Tensor, buffers: object)
     from ._stateful_candidates_numba import forward_candidates_step_into as step
 
     return step(cast(Any, state), tokens, cast(Any, buffers))
+
+
+def prefill_candidates_selected(
+    state: object, tokens: Tensor, query_positions: Tensor
+) -> Any:
+    """Ingest N rich-candidate tokens and return outputs only for ``[B, Q]``."""
+
+    from ._stateful_candidates_numba import prefill_candidates_selected as prefill
+
+    return prefill(cast(Any, state), tokens, query_positions)
 
 
 def init_inference_state(

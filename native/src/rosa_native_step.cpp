@@ -1210,6 +1210,7 @@ public:
       parallel_for_rows(64, [&](int64_t b) {
         count.mutable_data()[b] =
             step_row(b, tokens.data()[b], position_,
+                     true,
                      source.mutable_data() + b * slots,
                      match_length.mutable_data() + b * slots,
                      state_id.mutable_data() + b * slots,
@@ -1298,6 +1299,7 @@ public:
           reset_row(b);
         count.mutable_data()[b] = step_row(
             b, tokens.data()[b], current_position,
+            true,
             source.mutable_data() + b * slots,
             match_length.mutable_data() + b * slots,
             state_id.mutable_data() + b * slots,
@@ -1409,6 +1411,7 @@ public:
           const int64_t output_at = (b * sequence_length + position) * slots;
           count.mutable_data()[b * sequence_length + position] = step_row(
               b, tokens.data()[b * sequence_length + position], position,
+              true,
               source.mutable_data() + output_at,
               match_length.mutable_data() + output_at,
               state_id.mutable_data() + output_at,
@@ -1421,6 +1424,109 @@ public:
               position_);
     sync_owner_position();
     call_lock.unlock();
+  }
+
+  py::tuple prefill_selected(py::array tokens_object,
+                             py::array query_positions_object) {
+    if (ragged_mode_)
+      throw std::runtime_error(
+          "prefill is unavailable on a ragged candidate state");
+    if (!py::isinstance<py::array_t<int64_t>>(tokens_object) ||
+        tokens_object.ndim() != 2 || tokens_object.shape(0) != batch_)
+      throw py::value_error(
+          "tokens must be contiguous int64 [batch_size, sequence_length]");
+    if (!py::isinstance<py::array_t<int64_t>>(query_positions_object) ||
+        query_positions_object.ndim() != 2 ||
+        query_positions_object.shape(0) != batch_)
+      throw py::value_error(
+          "query_positions must be contiguous int64 [batch_size, query_count]");
+    const int64_t sequence_length = tokens_object.shape(1);
+    const int64_t query_count = query_positions_object.shape(1);
+    if (query_count <= 0)
+      throw py::value_error(
+          "query_positions must contain at least one query");
+    auto tokens = checked_input<int64_t>(tokens_object, "tokens",
+                                         {batch_, sequence_length});
+    auto query_positions = checked_input<int64_t>(
+        query_positions_object, "query_positions", {batch_, query_count});
+
+    std::vector<std::vector<std::pair<int64_t, int64_t>>> ordered_queries(
+        static_cast<size_t>(batch_));
+    for (int64_t b = 0; b < batch_; ++b) {
+      auto &row = ordered_queries[static_cast<size_t>(b)];
+      row.reserve(static_cast<size_t>(query_count));
+      for (int64_t q = 0; q < query_count; ++q) {
+        const int64_t position =
+            query_positions.data()[b * query_count + q];
+        if (position < 0 || position >= sequence_length)
+          throw py::value_error("query_positions values must be in [0, N)");
+        row.emplace_back(position, q);
+      }
+      std::sort(row.begin(), row.end());
+      for (int64_t q = 1; q < query_count; ++q)
+        if (row[static_cast<size_t>(q - 1)].first ==
+            row[static_cast<size_t>(q)].first)
+          throw py::value_error(
+              "query_positions must be unique within each batch row");
+    }
+
+    const int64_t slots = suffix_k_ * occurrences_r_;
+    py::array_t<int64_t> source({batch_, query_count, slots}),
+        match_length({batch_, query_count, slots}),
+        state_id({batch_, query_count, slots}),
+        candidate_frequency({batch_, query_count, slots});
+    py::array_t<int32_t> count({batch_, query_count});
+    const int64_t output_size = batch_ * query_count * slots;
+    validate_runtime_positions();
+    ensure_pool(4);
+    std::unique_lock<std::mutex> call_lock;
+    {
+      py::gil_scoped_release release;
+      call_lock = std::unique_lock<std::mutex>(call_mutex_);
+      if (position_ != 0)
+        throw std::runtime_error("prefill requires an empty candidate state");
+      if (sequence_length > max_length_)
+        throw std::runtime_error("candidate state capacity exceeded");
+      std::fill(source.mutable_data(), source.mutable_data() + output_size,
+                int64_t{-1});
+      std::fill(match_length.mutable_data(),
+                match_length.mutable_data() + output_size, int64_t{0});
+      std::fill(state_id.mutable_data(), state_id.mutable_data() + output_size,
+                int64_t{-1});
+      std::fill(candidate_frequency.mutable_data(),
+                candidate_frequency.mutable_data() + output_size, int64_t{0});
+      std::fill(count.mutable_data(),
+                count.mutable_data() + batch_ * query_count, int32_t{0});
+      parallel_for_rows(4, [&](int64_t b) {
+        const auto &row = ordered_queries[static_cast<size_t>(b)];
+        int64_t next_query = 0;
+        for (int64_t position = 0; position < sequence_length; ++position) {
+          const bool emit = next_query < query_count &&
+                            row[static_cast<size_t>(next_query)].first == position;
+          const int64_t output_query =
+              emit ? row[static_cast<size_t>(next_query)].second : 0;
+          const int64_t output_at =
+              (b * query_count + output_query) * slots;
+          const int32_t row_count = step_row(
+              b, tokens.data()[b * sequence_length + position], position, emit,
+              source.mutable_data() + output_at,
+              match_length.mutable_data() + output_at,
+              state_id.mutable_data() + output_at,
+              candidate_frequency.mutable_data() + output_at);
+          if (emit) {
+            count.mutable_data()[b * query_count + output_query] = row_count;
+            ++next_query;
+          }
+        }
+      });
+    }
+    position_ = sequence_length;
+    std::fill(positions_.mutable_data(), positions_.mutable_data() + batch_,
+              position_);
+    sync_owner_position();
+    call_lock.unlock();
+    return py::make_tuple(source, match_length, state_id, candidate_frequency,
+                          count);
   }
 
   int64_t position() const { return position_; }
@@ -1741,6 +1847,7 @@ private:
     apply_tag(b, node, &position, 1, 1);
   }
   int32_t step_row(int64_t b, int64_t token, int64_t position,
+                   bool emit_output,
                    int64_t *source_out, int64_t *length_out,
                    int64_t *state_out, int64_t *frequency_out) {
     int32_t last = last_.data()[b], size = size_.data()[b],
@@ -1804,7 +1911,7 @@ private:
     }
     last = current;
     int32_t candidate_count = 0, states_with_history = 0, node = last;
-    while (node != -1 && states_with_history < suffix_k_) {
+    while (emit_output && node != -1 && states_with_history < suffix_k_) {
       const int64_t at = idx(b, state_capacity_, node);
       if (length_.data()[at] > 0) {
         materialize(b, node);
@@ -5074,6 +5181,7 @@ PYBIND11_MODULE(rosa_native_step, m) {
       .def("reset_masked", &NativeCandidateState::reset_masked)
       .def("prefill", &NativeCandidateState::prefill)
       .def("prefill_into", &NativeCandidateState::prefill_into)
+      .def("prefill_selected", &NativeCandidateState::prefill_selected)
       .def_property_readonly("position", &NativeCandidateState::position)
       .def_property_readonly("positions", &NativeCandidateState::positions)
       .def_property_readonly("worker_count",

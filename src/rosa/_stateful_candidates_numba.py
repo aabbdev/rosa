@@ -417,6 +417,7 @@ def _step_row(
     last: int,
     size: int,
     edge_count: int,
+    emit_output: bool,
     output_source: np.ndarray,
     output_length: np.ndarray,
     output_state: np.ndarray,
@@ -615,40 +616,41 @@ def _step_row(
 
     last = current
     candidate_count = 0
-    states_with_history = 0
-    node = last
-    while node != -1 and states_with_history < suffix_k:
-        if length[node] > 0:
-            _materialize(
-                lct_left,
-                lct_right,
-                lct_parent,
-                occurrences,
-                occurrence_size,
-                frequency,
-                lazy_prefix,
-                lazy_size,
-                lazy_delta,
-                node,
-                lct_stack,
-            )
-            node_occurrences = int(occurrence_size[node])
-            if node_occurrences > 0:
-                states_with_history += 1
-                for occurrence_index in range(min(occurrences_r, node_occurrences)):
-                    source = int(occurrences[node, occurrence_index])
-                    duplicate = False
-                    for seen_index in range(candidate_count):
-                        if output_source[seen_index] == source:
-                            duplicate = True
-                            break
-                    if not duplicate:
-                        output_source[candidate_count] = source
-                        output_length[candidate_count] = length[node]
-                        output_state[candidate_count] = node
-                        output_frequency[candidate_count] = frequency[node]
-                        candidate_count += 1
-        node = int(suffix_link[node])
+    if emit_output:
+        states_with_history = 0
+        node = last
+        while node != -1 and states_with_history < suffix_k:
+            if length[node] > 0:
+                _materialize(
+                    lct_left,
+                    lct_right,
+                    lct_parent,
+                    occurrences,
+                    occurrence_size,
+                    frequency,
+                    lazy_prefix,
+                    lazy_size,
+                    lazy_delta,
+                    node,
+                    lct_stack,
+                )
+                node_occurrences = int(occurrence_size[node])
+                if node_occurrences > 0:
+                    states_with_history += 1
+                    for occurrence_index in range(min(occurrences_r, node_occurrences)):
+                        source = int(occurrences[node, occurrence_index])
+                        duplicate = False
+                        for seen_index in range(candidate_count):
+                            if output_source[seen_index] == source:
+                                duplicate = True
+                                break
+                        if not duplicate:
+                            output_source[candidate_count] = source
+                            output_length[candidate_count] = length[node]
+                            output_state[candidate_count] = node
+                            output_frequency[candidate_count] = frequency[node]
+                            candidate_count += 1
+            node = int(suffix_link[node])
 
     _path_write(
         lct_left,
@@ -735,6 +737,7 @@ def _step_batch_kernel(
             int(last[batch_index]),
             int(size[batch_index]),
             int(edge_count[batch_index]),
+            True,
             source[batch_index],
             match_length[batch_index],
             state_id[batch_index],
@@ -860,6 +863,7 @@ def _step_masked_batch_kernel(
             int(last[batch_index]),
             int(size[batch_index]),
             int(edge_count[batch_index]),
+            True,
             source[batch_index],
             match_length[batch_index],
             state_id[batch_index],
@@ -941,12 +945,105 @@ def _prefill_candidate_kernel(
                 int(last[batch_index]),
                 int(size[batch_index]),
                 int(edge_count[batch_index]),
+                True,
                 source[batch_index, position],
                 match_length[batch_index, position],
                 state_id[batch_index, position],
                 candidate_frequency[batch_index, position],
             )
             count[batch_index, position] = row_count
+            last[batch_index] = row_last
+            size[batch_index] = row_size
+            edge_count[batch_index] = row_edge_count
+    return source, match_length, state_id, candidate_frequency, count
+
+
+@njit(cache=True, nogil=True)
+def _prefill_candidate_selected_kernel(
+    tokens: np.ndarray,
+    query_positions: np.ndarray,
+    query_order: np.ndarray,
+    suffix_k: int,
+    occurrences_r: int,
+    history: np.ndarray,
+    head: np.ndarray,
+    edge_token: np.ndarray,
+    edge_target: np.ndarray,
+    edge_next: np.ndarray,
+    hash_state: np.ndarray,
+    hash_token: np.ndarray,
+    hash_edge: np.ndarray,
+    suffix_link: np.ndarray,
+    length: np.ndarray,
+    lct_left: np.ndarray,
+    lct_right: np.ndarray,
+    lct_parent: np.ndarray,
+    occurrences: np.ndarray,
+    occurrence_size: np.ndarray,
+    frequency: np.ndarray,
+    lazy_prefix: np.ndarray,
+    lazy_size: np.ndarray,
+    lazy_delta: np.ndarray,
+    lct_stack: np.ndarray,
+    last: np.ndarray,
+    size: np.ndarray,
+    edge_count: np.ndarray,
+) -> tuple[
+    np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray
+]:  # pragma: no cover
+    batch_size, sequence_length = tokens.shape
+    query_count = query_positions.shape[1]
+    slots = suffix_k * occurrences_r
+    source = np.full((batch_size, query_count, slots), -1, dtype=np.int64)
+    match_length = np.zeros((batch_size, query_count, slots), dtype=np.int64)
+    state_id = np.full((batch_size, query_count, slots), -1, dtype=np.int64)
+    candidate_frequency = np.zeros((batch_size, query_count, slots), dtype=np.int64)
+    count = np.zeros((batch_size, query_count), dtype=np.int32)
+    for batch_index in range(batch_size):
+        next_query = 0
+        for position in range(sequence_length):
+            emit = (
+                next_query < query_count
+                and query_positions[batch_index, next_query] == position
+            )
+            output_index = int(query_order[batch_index, next_query]) if emit else 0
+            row_count, row_last, row_size, row_edge_count = _step_row(
+                int(tokens[batch_index, position]),
+                position,
+                suffix_k,
+                occurrences_r,
+                history[batch_index],
+                head[batch_index],
+                edge_token[batch_index],
+                edge_target[batch_index],
+                edge_next[batch_index],
+                hash_state[batch_index],
+                hash_token[batch_index],
+                hash_edge[batch_index],
+                suffix_link[batch_index],
+                length[batch_index],
+                lct_left[batch_index],
+                lct_right[batch_index],
+                lct_parent[batch_index],
+                occurrences[batch_index],
+                occurrence_size[batch_index],
+                frequency[batch_index],
+                lazy_prefix[batch_index],
+                lazy_size[batch_index],
+                lazy_delta[batch_index],
+                lct_stack[batch_index],
+                int(last[batch_index]),
+                int(size[batch_index]),
+                int(edge_count[batch_index]),
+                emit,
+                source[batch_index, output_index],
+                match_length[batch_index, output_index],
+                state_id[batch_index, output_index],
+                candidate_frequency[batch_index, output_index],
+            )
+            if emit:
+                count[batch_index, output_index] = row_count
+                next_query += 1
             last[batch_index] = row_last
             size[batch_index] = row_size
             edge_count[batch_index] = row_edge_count
@@ -1224,6 +1321,29 @@ def _validate_candidate_tokens(
     if tokens.dtype not in _INTEGER_DTYPES:
         raise TypeError("tokens must use an integer dtype")
     return tokens, scalar
+
+
+def _validate_query_positions(
+    state: CandidateState,
+    tokens: Tensor,
+    query_positions: Tensor,
+) -> None:
+    if not isinstance(query_positions, Tensor):
+        raise TypeError("query_positions must be a Tensor")
+    if query_positions.dtype != torch.long:
+        raise TypeError("query_positions must have dtype torch.long")
+    if query_positions.ndim != 2 or query_positions.shape[0] != state.batch_size:
+        raise ValueError("query_positions must have shape [B, Q]")
+    if query_positions.shape[1] == 0:
+        raise ValueError("query_positions must contain at least one query")
+    if query_positions.device != tokens.device:
+        raise ValueError("query_positions must be on the same device as tokens")
+    sequence_length = tokens.shape[1]
+    if bool(((query_positions < 0) | (query_positions >= sequence_length)).any()):
+        raise ValueError("query_positions values must be in [0, N)")
+    ordered = query_positions.sort(dim=1).values
+    if ordered.shape[1] > 1 and bool((ordered[:, 1:] == ordered[:, :-1]).any()):
+        raise ValueError("query_positions must be unique within each batch row")
 
 
 def _candidate_step_from_arrays(
@@ -1797,6 +1917,78 @@ def prefill_candidates(state: CandidateState, tokens: Tensor) -> CandidateStep:
     if native_output is None:
         native_output = _prefill_candidate_kernel(
             cpu_tokens.numpy(),
+            state.suffix_k,
+            state.occurrences_r,
+            state.history,
+            state.head,
+            state.edge_token,
+            state.edge_target,
+            state.edge_next,
+            state.hash_state,
+            state.hash_token,
+            state.hash_edge,
+            state.suffix_link,
+            state.length,
+            state.lct_left,
+            state.lct_right,
+            state.lct_parent,
+            state.occurrences,
+            state.occurrence_size,
+            state.frequency,
+            state.lazy_prefix,
+            state.lazy_size,
+            state.lazy_delta,
+            state.lct_stack,
+            state.last,
+            state.size,
+            state.edge_count,
+        )
+        state.position = sequence_length
+    state.positions.fill(state.position)
+    return _candidate_step_from_arrays(state, native_output, device)
+
+
+def prefill_candidates_selected(
+    state: CandidateState,
+    tokens: Tensor,
+    query_positions: Tensor,
+) -> CandidateStep:
+    """Consume N tokens while emitting exact candidates only at ``[B, Q]``.
+
+    Query order is preserved independently for every batch row. The state is
+    left at N exactly as after :func:`prefill_candidates`, so decoding may
+    continue with :func:`forward_candidates_step`.
+    """
+
+    tokens, _ = _validate_candidate_tokens(state, tokens, sequence=True)
+    _validate_query_positions(state, tokens, query_positions)
+    if state.ragged_mode:
+        raise RuntimeError("prefill is unavailable on a ragged candidate state")
+    if state.position != 0:
+        raise RuntimeError("prefill requires an empty candidate state")
+    sequence_length = tokens.shape[1]
+    if sequence_length > state.max_length:
+        raise RuntimeError("candidate state capacity exceeded")
+
+    device = tokens.device
+    cpu_tokens = tokens.detach().to(device="cpu", dtype=torch.long).contiguous()
+    cpu_queries = query_positions.detach().to(device="cpu").contiguous()
+    token_array = cpu_tokens.numpy()
+    query_array = cpu_queries.numpy()
+
+    # Capability detection happens before either backend mutates the shared
+    # ABI-1 arrays. An older wheel can therefore fall back to selected Numba
+    # ingestion rather than replaying or gathering a full native prefill.
+    native_output = _native_candidate_call(
+        state, "prefill_selected", token_array, query_array
+    )
+    if native_output is None:
+        query_order = np.argsort(query_array, axis=1, kind="stable")
+        sorted_queries = np.take_along_axis(query_array, query_order, axis=1)
+        native_output = _prefill_candidate_selected_kernel(
+            token_array,
+            sorted_queries,
+            query_order,
             state.suffix_k,
             state.occurrences_r,
             state.history,

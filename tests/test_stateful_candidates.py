@@ -23,6 +23,7 @@ from rosa._stateful_candidates_numba import (
     forward_candidates_step_masked,
     prefill_candidates,
     prefill_candidates_into,
+    prefill_candidates_selected,
     reset_candidates_masked,
 )
 from rosa._stateful_candidates_numba import (
@@ -43,6 +44,12 @@ _FIELDS = (
 
 
 class TestStatefulCandidates(unittest.TestCase):
+    def assert_step_equal(self, actual: CandidateStep, expected: CandidateStep) -> None:
+        for name in _FIELDS:
+            self.assertTrue(
+                torch.equal(getattr(actual, name), getattr(expected, name)), name
+            )
+
     def test_close_is_idempotent_breaks_cycles_and_rejects_use(self) -> None:
         state = init_candidate_state_internal(1, 2, suffix_k=2, occurrences_r=2)
         buffers = init_candidate_buffers(state)
@@ -173,6 +180,120 @@ class TestStatefulCandidates(unittest.TestCase):
                     actual_tail, getattr(expected_full, field)[:, prefix.shape[1] :]
                 )
             )
+
+    def test_selected_prefill_is_q_only_ordered_and_continuable(self) -> None:
+        tokens_cpu = torch.tensor(
+            [[0, 1, 0, 2, 0, 1, 0, 3, 0], [3, 3, 4, 3, 5, 3, 4, 3, 3]]
+        )
+        query_cases = (
+            torch.tensor([[8], [0]]),
+            torch.tensor([[8, 0, 4], [1, 8, 0]]),
+            torch.tensor([list(reversed(range(9))), list(range(9))]),
+        )
+        devices = [torch.device("cpu")]
+        if torch.cuda.is_available():
+            devices.append(torch.device("cuda"))
+        backends = ["numba"]
+        try:
+            import rosa_native_step
+        except ModuleNotFoundError:
+            rosa_native_step = None
+        if rosa_native_step is not None and hasattr(
+            rosa_native_step.NativeCandidateState, "prefill_selected"
+        ):
+            backends.append("native")
+
+        for device, backend, queries_cpu in product(devices, backends, query_cases):
+            with self.subTest(device=device, backend=backend, queries=queries_cpu):
+                tokens = tokens_cpu.to(device)
+                queries = queries_cpu.to(device)
+                full_state = init_candidate_state_internal(
+                    2, 10, suffix_k=3, occurrences_r=2
+                )
+                selected_state = init_candidate_state_internal(
+                    2, 10, suffix_k=3, occurrences_r=2
+                )
+                if backend == "numba":
+                    full_state.native_state = False
+                    selected_state.native_state = False
+                else:
+                    assert rosa_native_step is not None
+                    full_state.native_state = rosa_native_step.NativeCandidateState(
+                        full_state
+                    )
+                    selected_state.native_state = rosa_native_step.NativeCandidateState(
+                        selected_state
+                    )
+                full = prefill_candidates(full_state, tokens)
+                selected = prefill_candidates_selected(selected_state, tokens, queries)
+                batch = torch.arange(2, device=device).unsqueeze(1)
+                expected = CandidateStep(
+                    *(getattr(full, field)[batch, queries] for field in _FIELDS)
+                )
+                self.assert_step_equal(selected, expected)
+                self.assertEqual(selected.source_index.shape[:2], queries.shape)
+                self.assertEqual(selected_state.position, 9)
+                self.assertEqual(selected_state.positions.tolist(), [9, 9])
+
+                continuation = torch.tensor([2, 4], device=device)
+                self.assert_step_equal(
+                    forward_candidates_step(selected_state, continuation),
+                    forward_candidates_step(full_state, continuation),
+                )
+
+    def test_selected_prefill_validation_and_old_wheel_fallback(self) -> None:
+        tokens = torch.tensor([[0, 1, 0], [2, 2, 3]])
+
+        class OldWheel:
+            def prefill(self, _tokens: np.ndarray) -> tuple[np.ndarray, ...]:
+                raise AssertionError("full prefill fallback must not be called")
+
+        old_state = init_candidate_state_internal(2, 3, suffix_k=2, occurrences_r=2)
+        old_state.native_state = OldWheel()
+        expected_state = init_candidate_state_internal(
+            2, 3, suffix_k=2, occurrences_r=2
+        )
+        expected_state.native_state = False
+        queries = torch.tensor([[2, 0], [1, 2]])
+        actual = prefill_candidates_selected(old_state, tokens, queries)
+        full = prefill_candidates(expected_state, tokens)
+        batch = torch.arange(2).unsqueeze(1)
+        self.assert_step_equal(
+            actual,
+            CandidateStep(*(getattr(full, field)[batch, queries] for field in _FIELDS)),
+        )
+        self.assertIs(old_state.native_state, False)
+
+        invalid = (
+            ([[0], [1]], TypeError, "must be a Tensor"),
+            (torch.zeros(2, 1), TypeError, "dtype torch.long"),
+            (torch.zeros(2, dtype=torch.long), ValueError, r"\[B, Q\]"),
+            (torch.zeros(1, 1, dtype=torch.long), ValueError, r"\[B, Q\]"),
+            (torch.empty(2, 0, dtype=torch.long), ValueError, "at least one"),
+            (torch.tensor([[0, 3], [1, 2]]), ValueError, r"\[0, N\)"),
+            (torch.tensor([[1, 1], [0, 2]]), ValueError, "unique"),
+        )
+        for positions, error_type, message in invalid:
+            state = init_candidate_state_internal(2, 3)
+            state.native_state = False
+            with (
+                self.subTest(message=message),
+                self.assertRaisesRegex(error_type, message),
+            ):
+                prefill_candidates_selected(state, tokens, positions)  # type: ignore[arg-type]
+            self.assertEqual(state.position, 0)
+            self.assertEqual(state.size.tolist(), [1, 1])
+
+        nonempty = init_candidate_state_internal(2, 4)
+        nonempty.native_state = False
+        forward_candidates_step(nonempty, tokens[:, 0])
+        with self.assertRaisesRegex(RuntimeError, "empty candidate state"):
+            prefill_candidates_selected(nonempty, tokens, queries)
+
+        if torch.cuda.is_available():
+            device_state = init_candidate_state_internal(2, 3)
+            with self.assertRaisesRegex(ValueError, "same device"):
+                prefill_candidates_selected(device_state, tokens.cuda(), queries)
 
     def test_allocating_native_dispatch_paths(self) -> None:
         def outputs(

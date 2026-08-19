@@ -1096,6 +1096,31 @@ class TestROSASemantics(unittest.TestCase):
         with self.assertRaises(TypeError):
             model(z, None, None, torch.tensor([[1], [2]]))
 
+    def test_stateful_query_only_uses_selected_prefill_builder(self) -> None:
+        from rosa._stateful_candidates_numba import prefill_candidates_selected
+
+        model = self.make_model(
+            candidate_backend="stateful", learned_residual_scale=1.0
+        )
+        z = torch.randn(2, 9, 8, requires_grad=True)
+        positions = torch.tensor([[8, 0, 4], [1, 8, 0]])
+        with (
+            patch(
+                "rosa._stateful_candidates_numba.prefill_candidates",
+                side_effect=AssertionError("full stateful prefill"),
+            ),
+            patch(
+                "rosa._stateful_candidates_numba.prefill_candidates_selected",
+                wraps=prefill_candidates_selected,
+            ) as selected,
+        ):
+            output = model(z, query_positions=positions)
+            loss = output.updated.square().mean() + sum(output.aux_losses.values())
+            loss.backward()
+        selected.assert_called_once()
+        self.assertEqual(output.candidate_source_index.shape[:2], (2, 9))
+        self.assertIsNotNone(z.grad)
+
     def test_query_positions_matches_full_gradients_and_sentinels(self) -> None:
         devices = [torch.device("cpu")]
         if torch.cuda.is_available():
