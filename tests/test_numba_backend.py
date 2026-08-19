@@ -93,6 +93,13 @@ class TestNumbaBackend(unittest.TestCase):
         expected, _, _ = reference_rosa(tokens)
         self.assertTrue(torch.equal(predict_exact_stateful(tokens), expected))
 
+    def test_private_state_close_is_idempotent_and_rejects_use(self) -> None:
+        state = _init_inference_state(1, 1)
+        state.close()
+        state.close()
+        with self.assertRaisesRegex(RuntimeError, "state is closed"):
+            _forward_step(state, torch.tensor([0]))
+
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
     def test_cuda_round_trip_matches_reference(self) -> None:
         tokens = torch.tensor(

@@ -284,6 +284,22 @@ class TestStatefulCandidates(unittest.TestCase):
             self.assertEqual(state.position, 0)
             self.assertEqual(state.size.tolist(), [1, 1])
 
+        device_state = init_candidate_state_internal(2, 3)
+        with self.assertRaisesRegex(ValueError, "same device"):
+            prefill_candidates_selected(
+                device_state,
+                tokens,
+                torch.empty((2, 1), dtype=torch.long, device="meta"),
+            )
+
+        ragged = init_candidate_state_internal(2, 3, ragged=True)
+        with self.assertRaisesRegex(RuntimeError, "ragged"):
+            prefill_candidates_selected(ragged, tokens, queries)
+
+        too_short = init_candidate_state_internal(2, 2)
+        with self.assertRaisesRegex(RuntimeError, "capacity"):
+            prefill_candidates_selected(too_short, tokens, queries)
+
         nonempty = init_candidate_state_internal(2, 4)
         nonempty.native_state = False
         forward_candidates_step(nonempty, tokens[:, 0])
@@ -373,6 +389,27 @@ class TestStatefulCandidates(unittest.TestCase):
             result = prefill_candidates(prefilled, torch.tensor([[1, 2], [3, 4]]))
         self.assertFalse(bool(result.mask.any()))
         self.assertEqual(prefilled.positions.tolist(), [2, 2])
+
+        selected = init_candidate_state_internal(2, 2, suffix_k=2, occurrences_r=2)
+
+        class SelectedNative:
+            def __init__(self, state: CandidateState) -> None:
+                self.state = state
+
+            def prefill_selected(
+                self, tokens: np.ndarray, queries: np.ndarray
+            ) -> tuple[np.ndarray, ...]:
+                self.state.position = tokens.shape[1]
+                return outputs(self.state, queries.shape[1])
+
+        selected.native_state = SelectedNative(selected)
+        selected_result = prefill_candidates_selected(
+            selected,
+            torch.tensor([[1, 2], [3, 4]]),
+            torch.tensor([[1], [0]]),
+        )
+        self.assertFalse(bool(selected_result.mask.any()))
+        self.assertEqual(selected.positions.tolist(), [2, 2])
 
     def test_caller_owned_step_and_prefill_buffers_are_exact(self) -> None:
         tokens = torch.tensor([[0, 1, 0, 2], [3, 3, 4, 3]])
@@ -794,6 +831,18 @@ class TestStatefulCandidates(unittest.TestCase):
                 init_candidate_state(1, 1)
             with self.assertRaisesRegex(RuntimeError, "numba"):
                 forward_candidates_step(object(), torch.tensor([1]))
+
+    def test_public_selected_prefill_wrapper_delegates(self) -> None:
+        sentinel = object()
+        with patch(
+            "rosa._stateful_candidates_numba.prefill_candidates_selected",
+            return_value=sentinel,
+        ) as delegated:
+            actual = __import__("rosa").prefill_candidates_selected(
+                object(), torch.tensor([[1]]), torch.tensor([[0]])
+            )
+        self.assertIs(actual, sentinel)
+        delegated.assert_called_once()
 
 
 if __name__ == "__main__":

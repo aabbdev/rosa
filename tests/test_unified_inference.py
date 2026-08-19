@@ -39,8 +39,9 @@ class TestUnifiedInferenceState(unittest.TestCase):
             lambda: managed.step_into(torch.tensor([0]), buffers),
             lambda: managed.prefill(tokens),
         ):
-            with self.subTest(access=access), self.assertRaisesRegex(
-                RuntimeError, "^state is closed$"
+            with (
+                self.subTest(access=access),
+                self.assertRaisesRegex(RuntimeError, "^state is closed$"),
             ):
                 access()
         managed.close()

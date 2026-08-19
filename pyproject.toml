@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "rosa-torch"
-version = "0.3.0"
+version = "0.4.0"
 description = "Independent PyTorch implementation of RWKV-8 ROSA with exact suffix-automaton retrieval"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -32,7 +32,7 @@ numba = ["numba>=0.66"]
 [project.urls]
 Repository = "https://github.com/aabbdev/rosa"
 Issues = "https://github.com/aabbdev/rosa/issues"
-Changelog = "https://github.com/aabbdev/rosa/blob/v0.3.0/CHANGELOG.md"
+Changelog = "https://github.com/aabbdev/rosa/blob/v0.4.0/CHANGELOG.md"
 "Original ROSA description" = "https://www.rwkv.com/#rwkv-8-explained"
 
 [dependency-groups]

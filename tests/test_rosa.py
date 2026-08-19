@@ -7,7 +7,7 @@ import threading
 import unittest
 import weakref
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from unittest.mock import patch
 
 import numpy as np
@@ -22,6 +22,7 @@ from rosa import (
     PreparedHardCandidates,
     _balance_kl,
     _build_forward_hard_candidates,
+    _build_forward_hard_candidates_selected,
     _clear_soft_match_compile_cache,
     _gather_sequence,
     _soft_match,
@@ -1240,6 +1241,109 @@ class TestROSASemantics(unittest.TestCase):
                     hard_candidates=prepare(),
                 )
 
+    def test_prepared_candidates_cover_all_metadata_guards(self) -> None:
+        model = self.make_model(candidate_backend="python")
+        tokens = torch.zeros((1, 3), dtype=torch.long)
+
+        for invalid, error_type, message in (
+            (object(), TypeError, "must be a Tensor"),
+            (tokens.float(), TypeError, "dtype torch.long"),
+            (tokens[0], ValueError, r"\[B, N\]"),
+            (torch.empty((1, 0), dtype=torch.long), ValueError, "dimensions"),
+            (
+                torch.empty((1, 3), dtype=torch.long, device="meta"),
+                ValueError,
+                "same device",
+            ),
+        ):
+            with (
+                self.subTest(message=message),
+                self.assertRaisesRegex(error_type, message),
+            ):
+                model.prepare_hard_candidates(invalid)  # type: ignore[arg-type]
+
+        def prepare() -> PreparedHardCandidates:
+            return model.prepare_hard_candidates(tokens)
+
+        with self.assertRaisesRegex(ValueError, "device does not match"):
+            model._validate_prepared_hard_candidates(
+                replace(prepare(), device=torch.device("meta")), tokens
+            )
+
+        non_tensor_field = prepare()
+        non_tensor_field.candidates.source_index = object()  # type: ignore[assignment]
+        with self.assertRaisesRegex(TypeError, "fields must all be Tensors"):
+            model._validate_prepared_hard_candidates(non_tensor_field, tokens)
+
+        with self.assertRaisesRegex(ValueError, "metadata is invalid"):
+            model._validate_prepared_hard_candidates(
+                replace(prepare(), tensor_versions=()), tokens
+            )
+        with self.assertRaisesRegex(ValueError, "hard_tokens metadata"):
+            model._validate_prepared_hard_candidates(
+                replace(prepare(), hard_tokens=tokens.float()), tokens
+            )
+
+        candidate_type = prepare()
+        original_tensors = model._prepared_tensors(candidate_type)
+        candidate_type.candidates.source_index = object()  # type: ignore[assignment]
+        with (
+            patch.object(model, "_prepared_tensors", return_value=original_tensors),
+            self.assertRaisesRegex(TypeError, "source_index.*Tensor"),
+        ):
+            model._validate_prepared_hard_candidates(candidate_type, tokens)
+
+        snapshots = prepare()
+        with self.assertRaisesRegex(TypeError, "snapshots must be Tensors"):
+            model._validate_prepared_hard_candidates(
+                replace(
+                    snapshots,
+                    _tensor_snapshots=(object(), *snapshots._tensor_snapshots[1:]),
+                ),
+                tokens,
+            )
+        with self.assertRaisesRegex(ValueError, "tensor metadata is invalid"):
+            model._validate_prepared_hard_candidates(
+                replace(
+                    snapshots,
+                    _tensor_snapshots=(
+                        torch.empty(0, dtype=torch.long),
+                        *snapshots._tensor_snapshots[1:],
+                    ),
+                ),
+                tokens,
+            )
+
+    def test_selected_builder_optional_dependency_fallbacks(self) -> None:
+        tokens = torch.tensor([[0, 1, 0]])
+        positions = torch.tensor([[2, 0]])
+
+        with (
+            patch(
+                "rosa._build_stateful_hard_candidates_selected",
+                side_effect=ModuleNotFoundError("unexpected", name="unexpected"),
+            ),
+            self.assertRaises(ModuleNotFoundError),
+        ):
+            _build_forward_hard_candidates_selected(tokens, positions, 2, 1, "auto")
+
+        missing_numba = ModuleNotFoundError("missing numba", name="numba")
+        with patch(
+            "rosa._build_stateful_hard_candidates_selected", side_effect=missing_numba
+        ):
+            with self.assertRaisesRegex(RuntimeError, "numba.*extra"):
+                _build_forward_hard_candidates_selected(
+                    tokens, positions, 2, 1, "stateful"
+                )
+            actual = _build_forward_hard_candidates_selected(
+                tokens, positions, 2, 1, "auto"
+            )
+        expected = _build_forward_hard_candidates_selected(
+            tokens, positions, 2, 1, "python"
+        )
+        for name in expected.__dataclass_fields__:
+            self.assertTrue(torch.equal(getattr(actual, name), getattr(expected, name)))
+
     def test_prepared_candidates_have_explicit_external_ownership(self) -> None:
         model = self.make_model(candidate_backend="python")
         z = torch.randn(1, 8, 8)
@@ -1295,6 +1399,34 @@ class TestROSASemantics(unittest.TestCase):
                 model(z, query_positions=positions)
         with self.assertRaises(TypeError):
             model(z, None, None, torch.tensor([[1], [2]]))
+        with self.assertRaisesRegex(ValueError, "same device"):
+            model(
+                z,
+                query_positions=torch.empty((2, 1), dtype=torch.long, device="meta"),
+            )
+
+    def test_private_zero_virtual_and_query_only_branch_edges(self) -> None:
+        no_virtual = self.make_model(virtual_candidates=0)
+        z = torch.randn(1, 4, 8)
+        source, mask, score = no_virtual._virtual_candidates(
+            z,
+            torch.empty((1, 4, 0), dtype=torch.long),
+            torch.empty((1, 4, 0), dtype=torch.bool),
+        )
+        self.assertEqual(source.shape, (1, 4, 0))
+        self.assertEqual(mask.shape, source.shape)
+        self.assertEqual(score.shape, source.shape)
+
+        one_anchor = self.make_model(
+            virtual_candidates=0,
+            dense_recent_candidates=1,
+            sparse_old_candidates=1,
+            sparse_old_pool_size=1,
+            soft_candidates_forward=True,
+        )
+        positions = torch.tensor([[3, 1, 0, 2]])
+        output = one_anchor(z, query_positions=positions)
+        self.assertEqual(output.updated.shape, z.shape)
 
     def test_stateful_query_only_uses_selected_prefill_builder(self) -> None:
         from rosa._stateful_candidates_numba import prefill_candidates_selected

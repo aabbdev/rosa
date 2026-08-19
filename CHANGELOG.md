@@ -3,6 +3,48 @@
 All notable changes to `rosa-torch` are documented here. The project follows
 semantic versioning while it remains in the 0.x development series.
 
+## 0.4.0 — 2026-08-19
+
+### Added
+
+- Query-position execution through `ROSA.forward(..., query_positions=...)`,
+  with full-shape public outputs and candidate computation restricted to Q.
+- Reusable `PreparedHardCandidates` snapshots with strict token, geometry,
+  backend, device, and mutation validation.
+- Exact native and Numba selected-prefill APIs that ingest N tokens, emit only
+  Q candidate rows, and preserve exact continuation.
+- Deterministic `close()` and context-manager support for persistent inference
+  states.
+
+### Changed
+
+- Removed native Python-owner reference cycles and made persistent state cleanup
+  deterministic.
+- Allowed `virtual_candidates=0` while preserving checkpoint compatibility and
+  expected zero gradients for inactive parameters.
+- Skipped inactive neural value projections without changing forward values or
+  training gradient coverage.
+- Preserved an exact one-hot straight-through forward while retaining the soft
+  backward path.
+
+### Performance
+
+- Reduced selected native candidate prefill from 15.65 ms to 5.72 ms on the
+  B16/N512/Q8 reference workload, while reducing candidate output storage from
+  about 4.66 MiB to 70 KiB.
+- Reduced the validated K4/R4/V1 query workload from 99.86 ms to 45.69 ms with
+  a task-specific K1/R1/V0 configuration.
+- Validated exact N32768/B1 query evaluation at 86.21 ms and 112.3 MiB peak CUDA
+  allocation on the reference system.
+
+### Compatibility
+
+- Existing calls without `query_positions` or `hard_candidates` keep the
+  historical execution path and output shapes.
+- Default candidate budgets and `backend="auto"` behavior are unchanged.
+- `rosa-torch-native 0.4.0` remains optional and requires
+  `rosa-torch>=0.4,<0.5` plus NumPy.
+
 ## 0.3.0 — 2026-08-18
 
 ### Added

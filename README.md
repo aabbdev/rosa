@@ -38,23 +38,24 @@ The design avoids a trainable dense automaton transition tensor and avoids dense
 - Optional shape-specialized `torch.compile` soft-match acceleration.
 - 100% statement and branch coverage for the `rosa` package.
 
-## What's new in 0.3.0
+## What's new in 0.4.0
 
-Version 0.3.0 adds exact long-context RLBWT inference while preserving the
-unified training and inference API introduced in 0.2.0:
+Version 0.4.0 improves exact differentiable retrieval and state lifecycle:
 
-- `backend="rlbwt"` provides a Python semantic oracle for exact online top-1
-  retrieval;
-- `backend="rlbwt_native"` fuses the same state machine in the optional C++
-  companion;
-- `backend="rlbwt_compact256"` adds compact exact storage for vocabularies up
-  to 256 IDs and very long configured contexts;
-- explicit `rlbwt_mc128` and `rlbwt_mc192` variants offer opt-in probabilistic
-  acceleration without changing exact `auto` dispatch;
-- lazy arenas and adaptive packed storage keep allocation tied to live context
-  length rather than maximum capacity.
+- `ROSA.forward(..., query_positions=...)` restricts candidate scoring and
+  value retrieval to selected positions while preserving full-shape outputs;
+- exact stateful prefill emits candidates only at those positions, with native
+  and Numba implementations and exact continuation after the context;
+- `PreparedHardCandidates` allows compatible consumers to share one exact hard
+  candidate construction;
+- `virtual_candidates=0` removes the virtual branch without changing model
+  parameters or checkpoint compatibility;
+- persistent inference states provide deterministic `close()` and context
+  manager cleanup;
+- inactive neural value projections are skipped while retaining the expected
+  zero gradients during training.
 
-See the [changelog](https://github.com/aabbdev/rosa/blob/v0.3.0/CHANGELOG.md)
+See the [changelog](https://github.com/aabbdev/rosa/blob/v0.4.0/CHANGELOG.md)
 for compatibility notes and the complete release summary.
 
 ## Core scoring rule
@@ -166,6 +167,14 @@ for token in generated_token_ids:  # each tensor has shape [2]
     predicted_token = forward_step(state, token)
 
 state.reset()
+state.close()
+```
+
+States can also be closed automatically:
+
+```python
+with init_inference_state(2, 32_768) as state:
+    predicted_token = forward_step(state, token_ids)
 ```
 
 Experimental top-1 RLBWT backends are also available: `rlbwt` is the Python
@@ -261,6 +270,43 @@ print(out.updated.shape)  # [B, N, D]
 print(out.chosen_source_index.shape)  # [B, N]
 print(out.hard_rosa_match_length.shape)  # [B, N]
 ```
+
+### Query-only retrieval
+
+When losses or outputs are needed at a small set of positions, pass one unique
+position per row in a `[B, Q]` `torch.long` tensor:
+
+```python
+query_positions = torch.tensor([[31, 63], [15, 63]], device=z_a.device)
+out = model(z_a, z_b=z_b, query_positions=query_positions)
+```
+
+The encoder and exact automaton still consume all `N` positions. Candidate
+scoring, value retrieval, and their intermediate tensors use `Q`; public
+outputs retain `[B, N, ...]` shapes with sentinel values outside the selected
+positions. Mask invalid positions before reducing fields such as
+`candidate_scores`, whose sentinel is `-inf`.
+
+### Reusing exact hard candidates
+
+Compatible forwards can share one detached exact candidate snapshot:
+
+```python
+_, _, hard_tokens = model.encode(z_a)
+prepared = model.prepare_hard_candidates(hard_tokens)
+
+out_a = model(z_a, hard_candidates=prepared)
+out_b = model(z_a, hard_candidates=prepared)
+```
+
+Consumers must use identical hard tokens, `suffix_k`, `occurrences_r`, backend,
+shape, and device. Stale or mutated snapshots are rejected before use.
+
+For workloads whose retrieval quality has been validated with one suffix state
+and one occurrence, `suffix_k=1`, `occurrences_r=1`, and
+`virtual_candidates=0` provide the smallest exact top-1 candidate geometry.
+The default budgets remain unchanged because larger candidate sets provide
+additional training and ranking alternatives.
 
 ROSA uses the eager bounded differentiable `_soft_match` implementation by
 default. Set `compile_soft_match=True` to opt into a static `torch.compile`
