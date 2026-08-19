@@ -810,7 +810,7 @@ def _st_categorical(
     soft = F.softmax(logits / temperature, dim=-1)
     ids = logits.argmax(dim=-1)
     hard = F.one_hot(ids, num_classes=logits.shape[-1]).to(logits.dtype)
-    st = hard + soft - soft.detach()
+    st = hard + (soft - soft.detach())
     return soft, st, ids
 
 
@@ -876,8 +876,8 @@ class ROSA(nn.Module):
             raise ValueError(
                 "suffix_k, occurrences_r and soft_verify_window must be > 0"
             )
-        if virtual_candidates <= 0 or virtual_pool_size < virtual_candidates:
-            raise ValueError("virtual_pool_size must be >= virtual_candidates > 0")
+        if virtual_candidates < 0 or virtual_pool_size < virtual_candidates:
+            raise ValueError("virtual_pool_size must be >= virtual_candidates >= 0")
         if dense_recent_candidates < 0:
             raise ValueError("dense_recent_candidates must be >= 0")
         if sparse_old_candidates < 0 or sparse_old_pool_size < sparse_old_candidates:
@@ -1169,6 +1169,13 @@ class ROSA(nn.Module):
         exact_mask: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor]:
         bsz, n, _ = z_a.shape
+        if self.virtual_candidates == 0:
+            shape = (bsz, n, 0)
+            return (
+                torch.empty(shape, dtype=torch.long, device=z_a.device),
+                torch.empty(shape, dtype=torch.bool, device=z_a.device),
+                torch.empty(shape, dtype=z_a.dtype, device=z_a.device),
+            )
         pool = build_virtual_pool_indices(bsz, n, self.virtual_pool_size, z_a.device)
         pool_mask = pool >= 0
         duplicate = (
@@ -1315,6 +1322,17 @@ class ROSA(nn.Module):
         ).expand_as(values)
         return result.scatter(1, index, values)
 
+    def _attach_skipped_virtual_gradients(
+        self, retrieved: Tensor, updated: Tensor
+    ) -> tuple[Tensor, Tensor]:
+        if self.virtual_candidates or not torch.is_grad_enabled():
+            return retrieved, updated
+        virtual_zero = retrieved.new_zeros(())
+        for module in (self.virtual_query, self.virtual_key):
+            for parameter in module.parameters():
+                virtual_zero = virtual_zero + parameter.sum() * 0
+        return retrieved + virtual_zero, updated + virtual_zero
+
     def _forward_query_only(
         self,
         z_a: Tensor,
@@ -1345,29 +1363,37 @@ class ROSA(nn.Module):
         exact_frequency = _gather_sequence(hard.frequency, query_positions)
         exact_slots = exact_source.shape[-1]
 
-        # The pool is discrete and cheap to build for N; floating candidate
-        # projections below are restricted to [B, Q, C, *].
-        virtual_pool = _gather_sequence(
-            build_virtual_pool_indices(bsz, n, self.virtual_pool_size, z_a.device),
-            query_positions,
-        )
-        virtual_pool_mask = virtual_pool >= 0
-        virtual_duplicate = (
-            virtual_pool.unsqueeze(-1) == exact_source.unsqueeze(-2)
-        ) & exact_mask.unsqueeze(-2)
-        virtual_pool_mask = virtual_pool_mask & ~virtual_duplicate.any(dim=-1)
-        virtual_query = self.virtual_query(z_query).unsqueeze(-2)
-        virtual_keys = self.virtual_key(_gather_sequence(z_a, virtual_pool))
-        virtual_router_all = (virtual_query * virtual_keys).sum(-1) / math.sqrt(
-            self.selector_dim
-        )
-        virtual_masked = virtual_router_all.masked_fill(~virtual_pool_mask, -1e9)
-        _, virtual_top = torch.topk(virtual_masked, k=self.virtual_candidates, dim=-1)
-        virtual_source = virtual_pool.gather(-1, virtual_top)
-        virtual_mask = virtual_pool_mask.gather(-1, virtual_top)
-        virtual_router = virtual_router_all.gather(-1, virtual_top)
-        virtual_mask = virtual_mask & (self.virtual_scale > 0)
-        virtual_router = virtual_router * self.virtual_scale
+        if self.virtual_candidates:
+            # The pool is discrete and cheap to build for N; floating candidate
+            # projections below are restricted to [B, Q, C, *].
+            virtual_pool = _gather_sequence(
+                build_virtual_pool_indices(bsz, n, self.virtual_pool_size, z_a.device),
+                query_positions,
+            )
+            virtual_pool_mask = virtual_pool >= 0
+            virtual_duplicate = (
+                virtual_pool.unsqueeze(-1) == exact_source.unsqueeze(-2)
+            ) & exact_mask.unsqueeze(-2)
+            virtual_pool_mask = virtual_pool_mask & ~virtual_duplicate.any(dim=-1)
+            virtual_query = self.virtual_query(z_query).unsqueeze(-2)
+            virtual_keys = self.virtual_key(_gather_sequence(z_a, virtual_pool))
+            virtual_router_all = (virtual_query * virtual_keys).sum(-1) / math.sqrt(
+                self.selector_dim
+            )
+            virtual_masked = virtual_router_all.masked_fill(~virtual_pool_mask, -1e9)
+            _, virtual_top = torch.topk(
+                virtual_masked, k=self.virtual_candidates, dim=-1
+            )
+            virtual_source = virtual_pool.gather(-1, virtual_top)
+            virtual_mask = virtual_pool_mask.gather(-1, virtual_top)
+            virtual_router = virtual_router_all.gather(-1, virtual_top)
+            virtual_mask = virtual_mask & (self.virtual_scale > 0)
+            virtual_router = virtual_router * self.virtual_scale
+        else:
+            shape = (bsz, queries, 0)
+            virtual_source = torch.empty(shape, dtype=torch.long, device=z_a.device)
+            virtual_mask = torch.empty(shape, dtype=torch.bool, device=z_a.device)
+            virtual_router = torch.empty(shape, dtype=z_a.dtype, device=z_a.device)
 
         dense_count = self.dense_recent_candidates
         sparse_count = self.sparse_old_candidates
@@ -1566,10 +1592,7 @@ class ROSA(nn.Module):
             hard_scores = scores.masked_fill(soft_only, -1e9)
         chosen = hard_scores.argmax(dim=-1)
         hard_weights = F.one_hot(chosen, num_classes=scores.shape[-1]).to(z_a.dtype)
-        if dense_count or sparse_count:
-            st_weights = hard_weights + (soft_weights - soft_weights.detach())
-        else:
-            st_weights = hard_weights + soft_weights - soft_weights.detach()
+        st_weights = hard_weights + (soft_weights - soft_weights.detach())
 
         next_position = torch.where(non_null_mask, source + 1, torch.zeros_like(source))
         next_st1 = _gather_sequence(st1, next_position)
@@ -1605,7 +1628,9 @@ class ROSA(nn.Module):
             historical_hard = F.one_hot(
                 historical_chosen, num_classes=historical_scores.shape[-1]
             ).to(z_a.dtype)
-            historical_st = historical_hard + historical_soft - historical_soft.detach()
+            historical_st = historical_hard + (
+                historical_soft - historical_soft.detach()
+            )
             historical_retrieved = torch.sum(
                 historical_st.unsqueeze(-1) * historical_values, dim=-2
             )
@@ -1616,7 +1641,9 @@ class ROSA(nn.Module):
                 historical_soft.unsqueeze(-1) * historical_values, dim=-2
             )
             backward_delta = union_soft_retrieved - historical_soft_retrieved
-            retrieved = historical_retrieved + backward_delta - backward_delta.detach()
+            retrieved = historical_retrieved + (
+                backward_delta - backward_delta.detach()
+            )
         else:
             retrieved = torch.sum(st_weights.unsqueeze(-1) * candidate_value, dim=-2)
 
@@ -1626,6 +1653,7 @@ class ROSA(nn.Module):
         ) + read_gate * self.out_proj(retrieved)
         update_index = query_positions.unsqueeze(-1).expand_as(updated_query)
         updated = z_b.scatter(1, update_index, updated_query)
+        retrieved, updated = self._attach_skipped_virtual_gradients(retrieved, updated)
         chosen_source = source.gather(-1, chosen.unsqueeze(-1)).squeeze(-1)
         chosen_kind = kind.gather(-1, chosen.unsqueeze(-1)).squeeze(-1)
         chosen_match = hard_match_length.gather(-1, chosen.unsqueeze(-1)).squeeze(-1)
@@ -1752,11 +1780,17 @@ class ROSA(nn.Module):
         exact_mask = hard.mask
         exact_slots = exact_source.shape[-1]
 
-        virtual_source, virtual_mask, virtual_router = self._virtual_candidates(
-            z_a, exact_source, exact_mask
-        )
-        virtual_mask = virtual_mask & (self.virtual_scale > 0)
-        virtual_router = virtual_router * self.virtual_scale
+        if self.virtual_candidates:
+            virtual_source, virtual_mask, virtual_router = self._virtual_candidates(
+                z_a, exact_source, exact_mask
+            )
+            virtual_mask = virtual_mask & (self.virtual_scale > 0)
+            virtual_router = virtual_router * self.virtual_scale
+        else:
+            shape = (*exact_source.shape[:2], 0)
+            virtual_source = torch.empty(shape, dtype=torch.long, device=z_a.device)
+            virtual_mask = torch.empty(shape, dtype=torch.bool, device=z_a.device)
+            virtual_router = torch.empty(shape, dtype=z_a.dtype, device=z_a.device)
 
         dense_source, dense_mask, sparse_source, sparse_mask = (
             self._hybrid_soft_candidates(st1, st2, exact_source, exact_mask)
@@ -1894,13 +1928,9 @@ class ROSA(nn.Module):
             hard_scores = scores.masked_fill(soft_only, -1e9)
         chosen = hard_scores.argmax(dim=-1)
         hard_weights = F.one_hot(chosen, num_classes=scores.shape[-1]).to(z_a.dtype)
-        if self.dense_recent_candidates or self.sparse_old_candidates:
-            # Parenthesizing the zero-valued correction makes the forward
-            # exactly one-hot while retaining the full-union softmax backward.
-            st_weights = hard_weights + (soft_weights - soft_weights.detach())
-        else:
-            # Preserve the historical arithmetic when both new budgets are 0.
-            st_weights = hard_weights + soft_weights - soft_weights.detach()
+        # Parenthesizing the zero-valued correction makes the forward exactly
+        # one-hot while retaining the full-union softmax backward.
+        st_weights = hard_weights + (soft_weights - soft_weights.detach())
 
         next_position = torch.where(non_null_mask, source + 1, torch.zeros_like(source))
         symbolic_value = self._candidate_symbolic_values(
@@ -1940,7 +1970,9 @@ class ROSA(nn.Module):
             historical_hard = F.one_hot(
                 historical_chosen, num_classes=historical_scores.shape[-1]
             ).to(z_a.dtype)
-            historical_st = historical_hard + historical_soft - historical_soft.detach()
+            historical_st = historical_hard + (
+                historical_soft - historical_soft.detach()
+            )
             historical_retrieved = torch.sum(
                 historical_st.unsqueeze(-1) * historical_values, dim=-2
             )
@@ -1959,6 +1991,7 @@ class ROSA(nn.Module):
 
         read_gate = torch.sigmoid(self.read_gate_head(z_a))
         updated = z_b + read_gate * self.out_proj(retrieved)
+        retrieved, updated = self._attach_skipped_virtual_gradients(retrieved, updated)
 
         chosen_source = source.gather(-1, chosen.unsqueeze(-1)).squeeze(-1)
         chosen_kind = kind.gather(-1, chosen.unsqueeze(-1)).squeeze(-1)

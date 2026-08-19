@@ -531,7 +531,7 @@ class TestROSAConfiguration(unittest.TestCase):
             (dict(d_model=4, suffix_k=0), "suffix_k"),
             (dict(d_model=4, occurrences_r=0), "suffix_k"),
             (dict(d_model=4, soft_verify_window=0), "suffix_k"),
-            (dict(d_model=4, virtual_candidates=0), "virtual_pool_size"),
+            (dict(d_model=4, virtual_candidates=-1), "virtual_pool_size"),
             (
                 dict(d_model=4, virtual_candidates=4, virtual_pool_size=3),
                 "virtual_pool_size",
@@ -662,6 +662,147 @@ class TestROSASemantics(unittest.TestCase):
                 self.assert_nested_equal(actual[key], expected[key], f"{name}.{key}")
         else:
             self.assertEqual(actual, expected, name)
+
+    def test_zero_virtual_candidates_skip_virtual_work_and_have_exact_width(
+        self,
+    ) -> None:
+        model = self.make_model(
+            suffix_k=2,
+            occurrences_r=3,
+            virtual_candidates=0,
+            dense_recent_candidates=2,
+            sparse_old_candidates=1,
+            sparse_old_pool_size=3,
+        )
+        z = torch.randn(2, 9, 8)
+        positions = torch.tensor([[1, 5], [2, 8]])
+        virtual_calls = 0
+
+        def virtual_hook(_module, _args, _output) -> None:
+            nonlocal virtual_calls
+            virtual_calls += 1
+
+        hooks = [
+            model.virtual_query.register_forward_hook(virtual_hook),
+            model.virtual_key.register_forward_hook(virtual_hook),
+        ]
+        try:
+            with (
+                patch.object(
+                    model,
+                    "_virtual_candidates",
+                    side_effect=AssertionError("unexpected virtual candidates"),
+                ),
+                patch(
+                    "rosa.build_virtual_pool_indices",
+                    side_effect=AssertionError("unexpected virtual pool"),
+                ),
+                patch(
+                    "rosa.torch.topk",
+                    side_effect=AssertionError("unexpected virtual topk"),
+                ),
+            ):
+                full = model(z)
+                query_only = model(z, query_positions=positions)
+
+                for output_name, query in (
+                    ("retrieved", None),
+                    ("updated", None),
+                    ("retrieved", positions),
+                    ("updated", positions),
+                ):
+                    model.zero_grad(set_to_none=True)
+                    output = model(z, query_positions=query)
+                    getattr(output, output_name).sum().backward()
+                    for parameter in (
+                        model.virtual_query.weight,
+                        model.virtual_key.weight,
+                    ):
+                        self.assertIsNotNone(parameter.grad)
+                        assert parameter.grad is not None
+                        self.assertEqual(torch.count_nonzero(parameter.grad).item(), 0)
+
+                with torch.no_grad():
+                    no_grad_full = model(z)
+                    no_grad_query = model(z, query_positions=positions)
+                with torch.inference_mode():
+                    inference_full = model(z)
+                    inference_query = model(z, query_positions=positions)
+        finally:
+            for hook in hooks:
+                hook.remove()
+
+        expected_width = 2 * 3 + 2 + 1 + 1
+        self.assertEqual(full.candidate_source_index.shape[-1], expected_width)
+        self.assertEqual(query_only.candidate_source_index.shape[-1], expected_width)
+        self.assertEqual(full.value_gate.shape[-1], expected_width)
+        self.assertEqual(query_only.value_gate.shape[-1], expected_width)
+        self.assertEqual(virtual_calls, 0)
+        for reference, no_grad, inference in (
+            (full, no_grad_full, inference_full),
+            (query_only, no_grad_query, inference_query),
+        ):
+            for name in ("retrieved", "updated"):
+                self.assertTrue(
+                    torch.equal(getattr(reference, name), getattr(no_grad, name))
+                )
+                self.assertTrue(
+                    torch.equal(getattr(reference, name), getattr(inference, name))
+                )
+
+    def test_zero_virtual_checkpoint_compatibility_and_runtime_reactivation(
+        self,
+    ) -> None:
+        source = self.make_model(
+            suffix_k=4,
+            occurrences_r=4,
+            virtual_candidates=1,
+        )
+        target = self.make_model(
+            suffix_k=1,
+            occurrences_r=1,
+            virtual_candidates=0,
+        )
+        incompatible = target.load_state_dict(source.state_dict(), strict=True)
+        self.assertEqual(incompatible.missing_keys, [])
+        self.assertEqual(incompatible.unexpected_keys, [])
+        self.assertIn("virtual_query.weight", target.state_dict())
+        self.assertIn("virtual_key.weight", target.state_dict())
+
+        z = torch.randn(1, 8, 8)
+        hard_tokens = target.encode(z)[2]
+        prepared_k1r1 = target.prepare_hard_candidates(hard_tokens)
+        prepared_k4r4 = source.prepare_hard_candidates(hard_tokens)
+        with self.assertRaisesRegex(ValueError, "suffix_k"):
+            target(z, hard_candidates=prepared_k4r4)
+
+        target.suffix_k = 2
+        with self.assertRaisesRegex(ValueError, "suffix_k"):
+            target(z, hard_candidates=prepared_k1r1)
+        target.suffix_k = 1
+        target.occurrences_r = 2
+        with self.assertRaisesRegex(ValueError, "occurrences_r"):
+            target(z, hard_candidates=prepared_k1r1)
+        target.occurrences_r = 1
+
+        calls = 0
+
+        def virtual_hook(_module, _args, _output) -> None:
+            nonlocal calls
+            calls += 1
+
+        hooks = [
+            target.virtual_query.register_forward_hook(virtual_hook),
+            target.virtual_key.register_forward_hook(virtual_hook),
+        ]
+        try:
+            target.virtual_candidates = 1
+            output = target(z)
+        finally:
+            for hook in hooks:
+                hook.remove()
+        self.assertEqual(output.candidate_source_index.shape[-1], 1 * 1 + 1 + 1)
+        self.assertEqual(calls, 2)
 
     def test_prepared_candidates_are_bit_exact_and_shared_without_rebuild(self) -> None:
         torch.manual_seed(20260819)
