@@ -7,6 +7,7 @@ import threading
 import unittest
 import weakref
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import FrozenInstanceError
 from unittest.mock import patch
 
 import numpy as np
@@ -18,6 +19,7 @@ from rosa import (
     NULL_KIND,
     ROSA,
     VIRTUAL_KIND,
+    PreparedHardCandidates,
     _balance_kl,
     _build_forward_hard_candidates,
     _clear_soft_match_compile_cache,
@@ -660,6 +662,276 @@ class TestROSASemantics(unittest.TestCase):
                 self.assert_nested_equal(actual[key], expected[key], f"{name}.{key}")
         else:
             self.assertEqual(actual, expected, name)
+
+    def test_prepared_candidates_are_bit_exact_and_shared_without_rebuild(self) -> None:
+        torch.manual_seed(20260819)
+        baseline_model = self.make_model(
+            candidate_backend="python",
+            learned_residual_scale=1.0,
+            neural_value_scale=1.0,
+        )
+        prepared_model = copy.deepcopy(baseline_model)
+        second_consumer = copy.deepcopy(baseline_model)
+        tokens = torch.randint(6, (2, 13))
+        baseline_z = torch.randn(2, 13, 8, requires_grad=True)
+        prepared_z = baseline_z.detach().clone().requires_grad_()
+        logits_base = factor_logits_from_tokens(
+            tokens, (2, 3), hi=0.4, lo=-0.2, requires_grad=True
+        )
+        logits_prepared = (
+            logits_base[0].detach().clone().requires_grad_(),
+            logits_base[1].detach().clone().requires_grad_(),
+        )
+
+        baseline = baseline_model(baseline_z, code_logits=logits_base)
+        baseline_loss = baseline.updated.square().sum() + sum(
+            value.square().sum() for value in baseline.aux_losses.values()
+        )
+        baseline_loss.backward()
+
+        calls = 0
+        original = rosa._build_forward_hard_candidates
+
+        def counted(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return original(*args, **kwargs)
+
+        with patch("rosa._build_forward_hard_candidates", side_effect=counted):
+            hard_tokens = prepared_model.encode(prepared_z, logits_prepared)[2]
+            prepared = prepared_model.prepare_hard_candidates(hard_tokens)
+            self.assertIsInstance(prepared, PreparedHardCandidates)
+            self.assertFalse(prepared.hard_tokens.requires_grad)
+            self.assertEqual(calls, 1)
+            actual = prepared_model(
+                prepared_z, code_logits=logits_prepared, hard_candidates=prepared
+            )
+            # Different logits with the same argmax remain valid for another model.
+            shifted_logits = tuple(value + 0.125 for value in logits_prepared)
+            shared = second_consumer(
+                prepared_z.detach(),
+                code_logits=shifted_logits,
+                hard_candidates=prepared,
+            )
+            self.assertEqual(calls, 1)
+
+        for name in baseline.__dataclass_fields__:
+            self.assert_nested_equal(
+                getattr(actual, name), getattr(baseline, name), name
+            )
+        self.assertTrue(torch.equal(shared.hard_tokens, actual.hard_tokens))
+        self.assertTrue(
+            torch.equal(shared.candidate_source_index, actual.candidate_source_index)
+        )
+        actual_loss = actual.updated.square().sum() + sum(
+            value.square().sum() for value in actual.aux_losses.values()
+        )
+        self.assertTrue(torch.equal(actual_loss, baseline_loss))
+        actual_loss.backward()
+        prepared_z_grad = prepared_z.grad
+        baseline_z_grad = baseline_z.grad
+        assert prepared_z_grad is not None
+        assert baseline_z_grad is not None
+        self.assertTrue(torch.equal(prepared_z_grad, baseline_z_grad))
+        for actual_logit, baseline_logit in zip(
+            logits_prepared, logits_base, strict=True
+        ):
+            actual_logit_grad = actual_logit.grad
+            baseline_logit_grad = baseline_logit.grad
+            assert actual_logit_grad is not None
+            assert baseline_logit_grad is not None
+            self.assertTrue(torch.equal(actual_logit_grad, baseline_logit_grad))
+        for (_, actual_parameter), (_, baseline_parameter) in zip(
+            prepared_model.named_parameters(),
+            baseline_model.named_parameters(),
+            strict=True,
+        ):
+            self.assertEqual(
+                actual_parameter.grad is None, baseline_parameter.grad is None
+            )
+            actual_parameter_grad = actual_parameter.grad
+            baseline_parameter_grad = baseline_parameter.grad
+            if actual_parameter_grad is not None:
+                assert baseline_parameter_grad is not None
+                self.assertTrue(
+                    torch.equal(actual_parameter_grad, baseline_parameter_grad)
+                )
+
+    def test_prepared_candidates_combine_with_query_positions(self) -> None:
+        model = self.make_model(candidate_backend="python", learned_residual_scale=1.0)
+        z = torch.randn(2, 11, 8)
+        tokens = torch.randint(6, (2, 11))
+        logits = factor_logits_from_tokens(tokens, (2, 3))
+        prepared = model.prepare_hard_candidates(model.encode(z, logits)[2])
+        positions = torch.tensor([[1, 5, 10], [0, 4, 8]])
+        expected = model(z, code_logits=logits, query_positions=positions)
+        with patch(
+            "rosa._build_forward_hard_candidates",
+            side_effect=AssertionError("unexpected rebuild"),
+        ):
+            actual = model(
+                z,
+                code_logits=logits,
+                query_positions=positions,
+                hard_candidates=prepared,
+            )
+        for name in expected.__dataclass_fields__:
+            self.assert_nested_equal(
+                getattr(actual, name), getattr(expected, name), name
+            )
+
+    def test_prepared_candidates_strict_rejections(self) -> None:
+        model = self.make_model(candidate_backend="python")
+        z = torch.randn(2, 9, 8)
+        tokens = torch.randint(6, (2, 9))
+        logits = factor_logits_from_tokens(tokens, (2, 3))
+
+        def prepare():
+            return model.prepare_hard_candidates(model.encode(z, logits)[2])
+
+        def forged(field, replacement):
+            base = prepare()
+            candidates = copy.deepcopy(base.candidates)
+            setattr(candidates, field, replacement)
+            snapshot = base.hard_tokens.clone()
+            tensors = (snapshot,) + tuple(
+                getattr(candidates, name) for name in candidates.__dataclass_fields__
+            )
+            return PreparedHardCandidates(
+                snapshot,
+                candidates,
+                base.suffix_k,
+                base.occurrences_r,
+                base.candidate_backend,
+                base.shape,
+                base.device,
+                tuple(tensor._version for tensor in tensors),
+                tuple(id(tensor) for tensor in tensors),
+                tuple(tensor.clone() for tensor in tensors),
+            )
+
+        with self.assertRaisesRegex(TypeError, "PreparedHardCandidates"):
+            model(z, code_logits=logits, hard_candidates=prepare().candidates)  # type: ignore[arg-type]
+        with self.assertRaises(FrozenInstanceError):
+            prepare().suffix_k = 99  # type: ignore[misc]
+
+        stale_logits = factor_logits_from_tokens(tokens.clone(), (2, 3))
+        # Force one encoded token to differ without changing shapes.
+        stale_logits[0].data[0, 0].fill_(-20.0)
+        stale_id = (int(tokens[0, 0] // 3) + 1) % 2
+        stale_logits[0].data[0, 0, stale_id] = 20.0
+        with self.assertRaisesRegex(ValueError, "stale"):
+            model(z, code_logits=stale_logits, hard_candidates=prepare())
+
+        for attribute, value, message in (
+            ("suffix_k", model.suffix_k + 1, "suffix_k"),
+            ("occurrences_r", model.occurrences_r + 1, "occurrences_r"),
+            ("candidate_backend", "stateful", "candidate_backend"),
+        ):
+            consumer = copy.deepcopy(model)
+            setattr(consumer, attribute, value)
+            with self.assertRaisesRegex(ValueError, message):
+                consumer(z, code_logits=logits, hard_candidates=prepare())
+
+        short_z = z[:, :-1]
+        short_logits = tuple(value[:, :-1] for value in logits)
+        with self.assertRaisesRegex(ValueError, "B/N"):
+            model(short_z, code_logits=short_logits, hard_candidates=prepare())
+
+        with self.assertRaisesRegex(ValueError, "source_index.*shape"):
+            model(
+                z,
+                code_logits=logits,
+                hard_candidates=forged(
+                    "source_index", torch.zeros(2, 9, 14, dtype=torch.long)
+                ),
+            )
+        with self.assertRaisesRegex(TypeError, "match_length.*dtype"):
+            model(
+                z,
+                code_logits=logits,
+                hard_candidates=forged(
+                    "match_length", torch.zeros(2, 9, 15, dtype=torch.float32)
+                ),
+            )
+        with self.assertRaisesRegex(ValueError, "source_index.*device"):
+            model(
+                z,
+                code_logits=logits,
+                hard_candidates=forged(
+                    "source_index",
+                    torch.empty(2, 9, 15, dtype=torch.long, device="meta"),
+                ),
+            )
+
+        for field, replacement in (
+            ("source_index", torch.zeros(2, 9, 1, dtype=torch.long)),
+            ("match_length", torch.zeros(2, 9, 15, dtype=torch.float32)),
+        ):
+            prepared = prepare()
+            setattr(prepared.candidates, field, replacement)
+            with self.assertRaises((TypeError, ValueError)):
+                model(z, code_logits=logits, hard_candidates=prepared)
+
+        prepared = prepare()
+        prepared.candidates.mask.logical_not_()
+        with self.assertRaisesRegex(ValueError, "mutated"):
+            model(z, code_logits=logits, hard_candidates=prepared)
+        prepared = prepare()
+        prepared.candidates.mask.data.logical_not_()
+        with self.assertRaisesRegex(ValueError, "mutated"):
+            model(z, code_logits=logits, hard_candidates=prepared)
+        prepared = prepare()
+        prepared.candidates.source_index.numpy()[0, 0, 0] = 42
+        with self.assertRaisesRegex(ValueError, "mutated"):
+            model(z, code_logits=logits, hard_candidates=prepared)
+        prepared = prepare()
+        prepared.hard_tokens.add_(1)
+        with self.assertRaisesRegex(ValueError, "mutated"):
+            model(z, code_logits=logits, hard_candidates=prepared)
+
+        if torch.cuda.is_available():
+            cuda_model = copy.deepcopy(model).cuda()
+            with self.assertRaisesRegex(ValueError, "device"):
+                cuda_model(
+                    z.cuda(),
+                    code_logits=tuple(value.cuda() for value in logits),
+                    hard_candidates=prepare(),
+                )
+
+    def test_prepared_candidates_have_explicit_external_ownership(self) -> None:
+        model = self.make_model(candidate_backend="python")
+        z = torch.randn(1, 8, 8)
+        tokens = torch.randint(6, (1, 8))
+        logits = factor_logits_from_tokens(tokens, (2, 3))
+        prepared = model.prepare_hard_candidates(model.encode(z, logits)[2])
+        state_keys = set(model.state_dict())
+        self.assertFalse(
+            any("prepared" in key or "candidate" in key for key in state_keys)
+        )
+        copied_model = copy.deepcopy(model)
+        copied_prepared = copy.deepcopy(prepared)
+        self.assertIsNot(copied_prepared.hard_tokens, prepared.hard_tokens)
+        copied_model(z, code_logits=logits, hard_candidates=copied_prepared)
+        model.to("cpu")
+        self.assertEqual(prepared.device.type, "cpu")
+        model(z, code_logits=logits, hard_candidates=prepared)
+
+    def test_prepared_candidates_support_inference_tensors(self) -> None:
+        model = self.make_model(candidate_backend="python")
+        z = torch.randn(1, 8, 8)
+        tokens = torch.randint(6, (1, 8))
+        logits = factor_logits_from_tokens(tokens, (2, 3))
+        with torch.inference_mode():
+            hard_tokens = model.encode(z, logits)[2]
+            prepared = model.prepare_hard_candidates(hard_tokens)
+            copied = copy.deepcopy(prepared)
+            expected = model(z, code_logits=logits)
+            actual = model(z, code_logits=logits, hard_candidates=copied)
+        for name in expected.__dataclass_fields__:
+            self.assert_nested_equal(
+                getattr(actual, name), getattr(expected, name), name
+            )
 
     def test_query_positions_validation_and_keyword_only_signature(self) -> None:
         model = self.make_model(candidate_backend="python")

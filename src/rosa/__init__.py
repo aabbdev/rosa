@@ -30,6 +30,7 @@ __all__ = [
     "ROSAInferenceState",
     "VIRTUAL_KIND",
     "HardCandidates",
+    "PreparedHardCandidates",
     "ROSAOutput",
     "build_hard_candidates",
     "build_virtual_pool_indices",
@@ -135,6 +136,62 @@ class HardCandidates:
     rosa_source_index: Tensor
     rosa_match_length: Tensor
     rosa_predicted_tokens: Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedHardCandidates:
+    """Immutable, reusable snapshot of exact hard candidate construction.
+
+    Tensor version counters and identities are captured so in-place mutation or
+    replacement of either the token snapshot or any candidate field is rejected
+    before the object can influence a forward pass.
+    """
+
+    hard_tokens: Tensor
+    candidates: HardCandidates
+    suffix_k: int
+    occurrences_r: int
+    candidate_backend: CandidateBackend
+    shape: tuple[int, int]
+    device: torch.device
+    tensor_versions: tuple[int | None, ...]
+    _tensor_ids: tuple[int, ...] = field(repr=False)
+    _tensor_snapshots: tuple[Tensor, ...] = field(repr=False)
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> PreparedHardCandidates:
+        snapshot = self.hard_tokens.detach().clone()
+        candidates = HardCandidates(
+            *(
+                getattr(self.candidates, name).detach().clone()
+                for name in HardCandidates.__dataclass_fields__
+            )
+        )
+        tensors = (snapshot,) + tuple(
+            getattr(candidates, name) for name in HardCandidates.__dataclass_fields__
+        )
+        copied = PreparedHardCandidates(
+            hard_tokens=snapshot,
+            candidates=candidates,
+            suffix_k=self.suffix_k,
+            occurrences_r=self.occurrences_r,
+            candidate_backend=self.candidate_backend,
+            shape=self.shape,
+            device=self.device,
+            tensor_versions=tuple(_tensor_version(tensor) for tensor in tensors),
+            _tensor_ids=tuple(id(tensor) for tensor in tensors),
+            _tensor_snapshots=tuple(tensor.detach().clone() for tensor in tensors),
+        )
+        memo[id(self)] = copied
+        return copied
+
+
+def _tensor_version(tensor: Tensor) -> int | None:
+    """Return a mutation counter, or ``None`` for inference tensors."""
+
+    try:
+        return tensor._version
+    except RuntimeError:
+        return None
 
 
 @dataclass
@@ -423,10 +480,7 @@ def _build_stateful_hard_candidates(
     try:
         candidates = prefill_candidates(state, tokens)
         result = HardCandidates(
-            *(
-                getattr(candidates, name)
-                for name in HardCandidates.__dataclass_fields__
-            )
+            *(getattr(candidates, name) for name in HardCandidates.__dataclass_fields__)
         )
         if not squeeze:
             return result
@@ -955,6 +1009,143 @@ class ROSA(nn.Module):
         hard_tokens = id1 * self.codebook_sizes[1] + id2
         return (p1, p2), (st1, st2), hard_tokens
 
+    @staticmethod
+    def _prepared_tensors(prepared: PreparedHardCandidates) -> tuple[Tensor, ...]:
+        hard = prepared.candidates
+        return (
+            prepared.hard_tokens,
+            hard.source_index,
+            hard.match_length,
+            hard.state_id,
+            hard.frequency,
+            hard.mask,
+            hard.rosa_slot,
+            hard.rosa_source_index,
+            hard.rosa_match_length,
+            hard.rosa_predicted_tokens,
+        )
+
+    def prepare_hard_candidates(self, hard_tokens: Tensor) -> PreparedHardCandidates:
+        """Build exact candidates once for reuse by compatible ROSA modules."""
+
+        if not isinstance(hard_tokens, Tensor):
+            raise TypeError("hard_tokens must be a Tensor")
+        if hard_tokens.dtype != torch.long:
+            raise TypeError("hard_tokens must have dtype torch.long")
+        if hard_tokens.ndim != 2:
+            raise ValueError("hard_tokens must have shape [B, N]")
+        if hard_tokens.shape[0] <= 0 or hard_tokens.shape[1] <= 0:
+            raise ValueError("hard_tokens dimensions must be > 0")
+        if hard_tokens.device != self.learned_residual_scale.device:
+            raise ValueError("hard_tokens must be on the same device as ROSA")
+
+        snapshot = hard_tokens.detach().clone()
+        candidates = _build_forward_hard_candidates(
+            snapshot,
+            self.suffix_k,
+            self.occurrences_r,
+            self.candidate_backend,
+        )
+        tensors = (snapshot,) + tuple(
+            getattr(candidates, name) for name in HardCandidates.__dataclass_fields__
+        )
+        return PreparedHardCandidates(
+            hard_tokens=snapshot,
+            candidates=candidates,
+            suffix_k=self.suffix_k,
+            occurrences_r=self.occurrences_r,
+            candidate_backend=self.candidate_backend,
+            shape=(int(snapshot.shape[0]), int(snapshot.shape[1])),
+            device=snapshot.device,
+            tensor_versions=tuple(_tensor_version(tensor) for tensor in tensors),
+            _tensor_ids=tuple(id(tensor) for tensor in tensors),
+            _tensor_snapshots=tuple(tensor.detach().clone() for tensor in tensors),
+        )
+
+    def _validate_prepared_hard_candidates(
+        self,
+        prepared: PreparedHardCandidates,
+        hard_tokens: Tensor,
+    ) -> HardCandidates:
+        if not isinstance(prepared, PreparedHardCandidates):
+            raise TypeError("hard_candidates must be a PreparedHardCandidates")
+        if prepared.suffix_k != self.suffix_k:
+            raise ValueError("hard_candidates suffix_k does not match ROSA")
+        if prepared.occurrences_r != self.occurrences_r:
+            raise ValueError("hard_candidates occurrences_r does not match ROSA")
+        if prepared.candidate_backend != self.candidate_backend:
+            raise ValueError("hard_candidates candidate_backend does not match ROSA")
+        expected_shape = (int(hard_tokens.shape[0]), int(hard_tokens.shape[1]))
+        if prepared.shape != expected_shape:
+            raise ValueError("hard_candidates B/N shape does not match forward")
+        if prepared.device != hard_tokens.device:
+            raise ValueError("hard_candidates device does not match forward")
+
+        tensors = self._prepared_tensors(prepared)
+        if not all(isinstance(tensor, Tensor) for tensor in tensors):
+            raise TypeError("hard_candidates fields must all be Tensors")
+        if (
+            len(prepared.tensor_versions) != len(tensors)
+            or len(prepared._tensor_ids) != len(tensors)
+            or len(prepared._tensor_snapshots) != len(tensors)
+        ):
+            raise ValueError("hard_candidates tensor metadata is invalid")
+        if (
+            prepared.hard_tokens.dtype != torch.long
+            or tuple(prepared.hard_tokens.shape) != expected_shape
+            or prepared.hard_tokens.device != prepared.device
+        ):
+            raise ValueError("hard_candidates hard_tokens metadata is invalid")
+        slots = self.suffix_k * self.occurrences_r
+        slot_shape = (*expected_shape, slots)
+        row_shape = expected_shape
+        expected = {
+            "source_index": (slot_shape, torch.long),
+            "match_length": (slot_shape, torch.long),
+            "state_id": (slot_shape, torch.long),
+            "frequency": (slot_shape, torch.long),
+            "mask": (slot_shape, torch.bool),
+            "rosa_slot": (row_shape, torch.long),
+            "rosa_source_index": (row_shape, torch.long),
+            "rosa_match_length": (row_shape, torch.long),
+            "rosa_predicted_tokens": (row_shape, torch.long),
+        }
+        for name, (shape, dtype) in expected.items():
+            tensor = getattr(prepared.candidates, name)
+            if not isinstance(tensor, Tensor):
+                raise TypeError(f"hard_candidates.{name} must be a Tensor")
+            if tuple(tensor.shape) != shape:
+                raise ValueError(f"hard_candidates.{name} has invalid shape")
+            if tensor.dtype != dtype:
+                raise TypeError(f"hard_candidates.{name} has invalid dtype")
+            if tensor.device != prepared.device:
+                raise ValueError(f"hard_candidates.{name} has invalid device")
+
+        for tensor, identity, version, snapshot in zip(
+            tensors,
+            prepared._tensor_ids,
+            prepared.tensor_versions,
+            prepared._tensor_snapshots,
+            strict=True,
+        ):
+            if not isinstance(snapshot, Tensor):
+                raise TypeError("hard_candidates integrity snapshots must be Tensors")
+            if (
+                snapshot.shape != tensor.shape
+                or snapshot.dtype != tensor.dtype
+                or snapshot.device != tensor.device
+            ):
+                raise ValueError("hard_candidates tensor metadata is invalid")
+            if (
+                id(tensor) != identity
+                or _tensor_version(tensor) != version
+                or not torch.equal(tensor, snapshot)
+            ):
+                raise ValueError("hard_candidates was mutated")
+        if not torch.equal(prepared.hard_tokens, hard_tokens):
+            raise ValueError("hard_candidates is stale for encoded hard_tokens")
+        return prepared.candidates
+
     def _soft_match(
         self,
         st1: Tensor,
@@ -1130,15 +1321,20 @@ class ROSA(nn.Module):
         z_b: Tensor,
         code_logits: tuple[Tensor, Tensor] | None,
         query_positions: Tensor,
+        hard_candidates: PreparedHardCandidates | None,
     ) -> ROSAOutput:
         """Run candidate activations only at selected sequence positions."""
 
         (soft1, soft2), (st1, st2), hard_tokens = self.encode(z_a, code_logits)
-        hard = _build_forward_hard_candidates(
-            hard_tokens,
-            self.suffix_k,
-            self.occurrences_r,
-            self.candidate_backend,
+        hard = (
+            _build_forward_hard_candidates(
+                hard_tokens,
+                self.suffix_k,
+                self.occurrences_r,
+                self.candidate_backend,
+            )
+            if hard_candidates is None
+            else self._validate_prepared_hard_candidates(hard_candidates, hard_tokens)
         )
         bsz, n, _ = z_a.shape
         queries = query_positions.shape[1]
@@ -1510,6 +1706,7 @@ class ROSA(nn.Module):
         code_logits: tuple[Tensor, Tensor] | None = None,
         *,
         query_positions: Tensor | None = None,
+        hard_candidates: PreparedHardCandidates | None = None,
     ) -> ROSAOutput:
         if z_a.ndim != 3 or z_a.shape[-1] != self.d_model:
             raise ValueError("z_a must have shape [B, N, d_model]")
@@ -1530,18 +1727,26 @@ class ROSA(nn.Module):
                 if torch.equal(query_positions, full_positions):
                     # Route the canonical full query set through the untouched
                     # historical implementation, including operation order.
-                    return self.forward(z_a, z_b, code_logits)
-            return self._forward_query_only(z_a, z_b, code_logits, query_positions)
+                    return self.forward(
+                        z_a, z_b, code_logits, hard_candidates=hard_candidates
+                    )
+            return self._forward_query_only(
+                z_a, z_b, code_logits, query_positions, hard_candidates
+            )
 
         (soft1, soft2), (st1, st2), hard_tokens = self.encode(z_a, code_logits)
         # Keep the exact, non-differentiable automaton on CPU as proposed for
         # RWKV-8 ROSA. Accelerator backends may optimize the tensor path around
         # it, but must not silently replace this exact discrete control path.
-        hard = _build_forward_hard_candidates(
-            hard_tokens,
-            self.suffix_k,
-            self.occurrences_r,
-            self.candidate_backend,
+        hard = (
+            _build_forward_hard_candidates(
+                hard_tokens,
+                self.suffix_k,
+                self.occurrences_r,
+                self.candidate_backend,
+            )
+            if hard_candidates is None
+            else self._validate_prepared_hard_candidates(hard_candidates, hard_tokens)
         )
         exact_source = hard.source_index
         exact_mask = hard.mask
