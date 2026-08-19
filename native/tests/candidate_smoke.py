@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import os
 import threading
+import types
 import weakref
 from concurrent.futures import ThreadPoolExecutor
 from itertools import product
@@ -290,11 +291,33 @@ def main() -> None:
 
     state = init_candidate_state(2, 4, suffix_k=3, occurrences_r=2)
     state_ref = weakref.ref(state)
+    history_ref = weakref.ref(state.history)
     native = rosa_native_step.NativeCandidateState(state)
+    state.position = 3
+    native.step(np.array([1, 2], dtype=np.int64))
+    assert state.position == native.position == 1
     del state
     gc.collect()
-    assert state_ref() is not None
-    native.step(np.array([1, 2], dtype=np.int64))
+    assert state_ref() is None
+    assert history_ref() is not None
+    native.step(np.array([3, 4], dtype=np.int64))
+    assert native.position == 2
+    assert history_ref()[:, :2].tolist() == [[1, 3], [2, 4]]
+
+    cyclic_owner = init_candidate_state(1, 2)
+    cyclic_wrapper = rosa_native_step.NativeCandidateState(cyclic_owner)
+    cyclic_owner.native_state = cyclic_wrapper
+    cyclic_owner_ref = weakref.ref(cyclic_owner)
+    cyclic_wrapper_ref = weakref.ref(cyclic_wrapper)
+    del cyclic_owner, cyclic_wrapper
+    gc.collect()
+    assert cyclic_owner_ref() is None
+    assert cyclic_wrapper_ref() is None
+
+    nonweak_owner = types.SimpleNamespace(**vars(init_candidate_state(1, 2)))
+    nonweak = rosa_native_step.NativeCandidateState(nonweak_owner)
+    nonweak.step(np.array([11], dtype=np.int64))
+    assert nonweak.position == 1
 
     # ABI 1 compatibility: pre-positions uniform states remain accepted.
     legacy = init_candidate_state(1, 2)
